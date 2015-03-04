@@ -170,6 +170,11 @@ def get_next_device_name(instance, device_name_list,
     if driver.compute_driver_matches('xenapi.XenAPIDriver'):
         prefix = '/dev/xvd'
 
+    if driver.compute_driver_matches('libvirt.LibvirtDriver'):
+        prefix = req_prefix
+	    if prefix is None:
+	        prefix = '/dev/vd'	
+
     if req_prefix != prefix:
         LOG.debug("Using %(prefix)s instead of %(req_prefix)s",
                   {'prefix': prefix, 'req_prefix': req_prefix})
