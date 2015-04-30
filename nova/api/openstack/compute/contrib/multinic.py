@@ -15,16 +15,17 @@
 
 """The multinic extension."""
 
+from oslo_log import log as logging
 import webob
 from webob import exc
 
+from nova.api.openstack import common
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova import compute
 from nova import exception
 from nova.i18n import _
 from nova.i18n import _LE
-from nova.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
@@ -35,14 +36,6 @@ class MultinicController(wsgi.Controller):
     def __init__(self, *args, **kwargs):
         super(MultinicController, self).__init__(*args, **kwargs)
         self.compute_api = compute.API()
-
-    def _get_instance(self, context, instance_id, want_objects=False):
-        try:
-            return self.compute_api.get(context, instance_id,
-                                        want_objects=want_objects)
-        except exception.InstanceNotFound:
-            msg = _("Server not found")
-            raise exc.HTTPNotFound(explanation=msg)
 
     @wsgi.action('addFixedIp')
     def _add_fixed_ip(self, req, id, body):
@@ -55,7 +48,7 @@ class MultinicController(wsgi.Controller):
             msg = _("Missing 'networkId' argument for addFixedIp")
             raise exc.HTTPBadRequest(explanation=msg)
 
-        instance = self._get_instance(context, id, want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
         network_id = body['addFixedIp']['networkId']
         try:
             self.compute_api.add_fixed_ip(context, instance, network_id)
@@ -75,8 +68,7 @@ class MultinicController(wsgi.Controller):
             msg = _("Missing 'address' argument for removeFixedIp")
             raise exc.HTTPBadRequest(explanation=msg)
 
-        instance = self._get_instance(context, id,
-                                      want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
         address = body['removeFixedIp']['address']
 
         try:

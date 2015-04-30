@@ -14,8 +14,7 @@
 
 """The rescue mode extension."""
 
-from oslo.config import cfg
-import webob
+from oslo_config import cfg
 from webob import exc
 
 from nova.api.openstack import common
@@ -33,13 +32,13 @@ CONF = cfg.CONF
 CONF.import_opt('enable_instance_password',
                 'nova.api.openstack.compute.servers')
 
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class RescueController(wsgi.Controller):
     def __init__(self, *args, **kwargs):
         super(RescueController, self).__init__(*args, **kwargs)
-        self.compute_api = compute.API()
+        self.compute_api = compute.API(skip_policy_check=True)
 
     # TODO(cyeoh): Should be responding here with 202 Accept
     # because rescue is an async call, but keep to 200
@@ -57,8 +56,7 @@ class RescueController(wsgi.Controller):
         else:
             password = utils.generate_password()
 
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
         rescue_image_ref = None
         if body['rescue'] and 'rescue_image_ref' in body['rescue']:
             rescue_image_ref = body['rescue']['rescue_image_ref']
@@ -71,7 +69,7 @@ class RescueController(wsgi.Controller):
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                                                                  'rescue')
+                                                                  'rescue', id)
         except exception.InvalidVolume as volume_error:
             raise exc.HTTPConflict(explanation=volume_error.format_message())
         except exception.InstanceNotRescuable as non_rescuable:
@@ -83,26 +81,22 @@ class RescueController(wsgi.Controller):
         else:
             return {}
 
-    # TODO(cyeoh): Should be responding here with 202 Accept
-    # because unrescue is an async call, but keep to 200
-    # for backwards compatibility reasons.
+    @wsgi.response(202)
     @extensions.expected_errors((404, 409, 501))
     @wsgi.action('unrescue')
     def _unrescue(self, req, id, body):
         """Unrescue an instance."""
         context = req.environ["nova.context"]
         authorize(context)
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
         try:
             self.compute_api.unrescue(context, instance)
         except exception.InstanceIsLocked as e:
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                                                                  'unrescue')
-
-        return webob.Response(status_int=202)
+                                                                  'unrescue',
+                                                                  id)
 
 
 class Rescue(extensions.V3APIExtensionBase):

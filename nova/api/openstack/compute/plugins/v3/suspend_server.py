@@ -12,7 +12,6 @@
 #   License for the specific language governing permissions and limitations
 #   under the License.
 
-import webob
 from webob import exc
 
 from nova.api.openstack import common
@@ -20,55 +19,49 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova import compute
 from nova import exception
-from nova.openstack.common import log as logging
 
-LOG = logging.getLogger(__name__)
 ALIAS = "os-suspend-server"
 
 
-def authorize(context, action_name):
-    action = 'v3:%s:%s' % (ALIAS, action_name)
-    extensions.extension_authorizer('compute', action)(context)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class SuspendServerController(wsgi.Controller):
     def __init__(self, *args, **kwargs):
         super(SuspendServerController, self).__init__(*args, **kwargs)
-        self.compute_api = compute.API()
+        self.compute_api = compute.API(skip_policy_check=True)
 
+    @wsgi.response(202)
     @extensions.expected_errors((404, 409))
     @wsgi.action('suspend')
     def _suspend(self, req, id, body):
         """Permit admins to suspend the server."""
         context = req.environ['nova.context']
-        authorize(context, 'suspend')
+        authorize(context, action='suspend')
         try:
-            server = common.get_instance(self.compute_api, context, id,
-                                         want_objects=True)
+            server = common.get_instance(self.compute_api, context, id)
             self.compute_api.suspend(context, server)
         except exception.InstanceIsLocked as e:
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                    'suspend')
-        return webob.Response(status_int=202)
+                    'suspend', id)
 
+    @wsgi.response(202)
     @extensions.expected_errors((404, 409))
     @wsgi.action('resume')
     def _resume(self, req, id, body):
         """Permit admins to resume the server from suspend."""
         context = req.environ['nova.context']
-        authorize(context, 'resume')
+        authorize(context, action='resume')
         try:
-            server = common.get_instance(self.compute_api, context, id,
-                                         want_objects=True)
+            server = common.get_instance(self.compute_api, context, id)
             self.compute_api.resume(context, server)
         except exception.InstanceIsLocked as e:
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                    'resume')
-        return webob.Response(status_int=202)
+                    'resume', id)
 
 
 class SuspendServer(extensions.V3APIExtensionBase):

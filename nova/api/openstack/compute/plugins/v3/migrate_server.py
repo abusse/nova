@@ -13,7 +13,7 @@
 #   License for the specific language governing permissions and limitations
 #   under the License.
 
-import webob
+from oslo_utils import strutils
 from webob import exc
 
 from nova.api.openstack import common
@@ -23,30 +23,27 @@ from nova.api.openstack import wsgi
 from nova.api import validation
 from nova import compute
 from nova import exception
-from nova.openstack.common import strutils
 
 ALIAS = "os-migrate-server"
 
 
-def authorize(context, action_name):
-    action = 'v3:%s:%s' % (ALIAS, action_name)
-    extensions.extension_authorizer('compute', action)(context)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class MigrateServerController(wsgi.Controller):
     def __init__(self, *args, **kwargs):
         super(MigrateServerController, self).__init__(*args, **kwargs)
-        self.compute_api = compute.API()
+        self.compute_api = compute.API(skip_policy_check=True)
 
+    @wsgi.response(202)
     @extensions.expected_errors((400, 403, 404, 409))
     @wsgi.action('migrate')
     def _migrate(self, req, id, body):
         """Permit admins to migrate a server to a new host."""
         context = req.environ['nova.context']
-        authorize(context, 'migrate')
+        authorize(context, action='migrate')
 
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
         try:
             self.compute_api.resize(req.environ['nova.context'], instance)
         except (exception.TooManyInstances, exception.QuotaError) as e:
@@ -55,21 +52,20 @@ class MigrateServerController(wsgi.Controller):
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                    'migrate')
+                    'migrate', id)
         except exception.InstanceNotFound as e:
             raise exc.HTTPNotFound(explanation=e.format_message())
         except exception.NoValidHost as e:
             raise exc.HTTPBadRequest(explanation=e.format_message())
 
-        return webob.Response(status_int=202)
-
+    @wsgi.response(202)
     @extensions.expected_errors((400, 404, 409))
     @wsgi.action('os-migrateLive')
     @validation.schema(migrate_server.migrate_live)
     def _migrate_live(self, req, id, body):
         """Permit admins to (live) migrate a server to a new host."""
         context = req.environ["nova.context"]
-        authorize(context, 'migrate_live')
+        authorize(context, action='migrate_live')
 
         block_migration = body["os-migrateLive"]["block_migration"]
         disk_over_commit = body["os-migrateLive"]["disk_over_commit"]
@@ -81,8 +77,7 @@ class MigrateServerController(wsgi.Controller):
                                                      strict=True)
 
         try:
-            instance = common.get_instance(self.compute_api, context, id,
-                                           want_objects=True)
+            instance = common.get_instance(self.compute_api, context, id)
             self.compute_api.live_migrate(context, instance, block_migration,
                                           disk_over_commit, host)
         except (exception.NoValidHost,
@@ -94,7 +89,6 @@ class MigrateServerController(wsgi.Controller):
                 exception.InvalidLocalStorage,
                 exception.InvalidSharedStorage,
                 exception.HypervisorUnavailable,
-                exception.InstanceNotRunning,
                 exception.MigrationPreCheckError,
                 exception.LiveMigrationWithOldNovaNotSafe) as ex:
             raise exc.HTTPBadRequest(explanation=ex.format_message())
@@ -102,8 +96,7 @@ class MigrateServerController(wsgi.Controller):
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                    'os-migrateLive')
-        return webob.Response(status_int=202)
+                    'os-migrateLive', id)
 
 
 class MigrateServer(extensions.V3APIExtensionBase):

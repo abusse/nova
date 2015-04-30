@@ -13,10 +13,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-
 import netaddr
 import netaddr.core as netexc
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 import six
 import webob
 from webob import exc
@@ -26,41 +26,29 @@ from nova import context as nova_context
 from nova import exception
 from nova.i18n import _
 from nova.i18n import _LE
-from nova.i18n import _LI
 import nova.network
-from nova.openstack.common import log as logging
 from nova import quota
 
 
 CONF = cfg.CONF
 
-try:
-    os_network_opts = [
-        cfg.BoolOpt("enable_network_quota",
-                    default=False,
-                    help=('Enables or disables quota checking for tenant '
-                          'networks')),
-        cfg.StrOpt('use_neutron_default_nets',
-                         default="False",
-                         help=('Control for checking for default networks')),
-        cfg.StrOpt('neutron_default_tenant_id',
-                         default="default",
-                         help=('Default tenant id when creating neutron '
-                               'networks'))
-    ]
-    CONF.register_opts(os_network_opts)
-except cfg.DuplicateOptError:
-    # NOTE(jkoelker) These options are verbatim elsewhere this is here
-    #                to make sure they are registered for our use.
-    pass
-
-if CONF.enable_network_quota:
-    opts = [
-        cfg.IntOpt('quota_networks',
-                   default=3,
-                   help='Number of private networks allowed per project'),
-        ]
-    CONF.register_opts(opts)
+os_network_opts = [
+    cfg.BoolOpt("enable_network_quota",
+                default=False,
+                help='Enables or disables quota checking for tenant '
+                     'networks'),
+    cfg.StrOpt('use_neutron_default_nets',
+                     default="False",
+                     help='Control for checking for default networks'),
+    cfg.StrOpt('neutron_default_tenant_id',
+                     default="default",
+                     help='Default tenant id when creating neutron '
+                          'networks'),
+    cfg.IntOpt('quota_networks',
+               default=3,
+               help='Number of private networks allowed per project'),
+]
+CONF.register_opts(os_network_opts)
 
 QUOTAS = quota.QUOTAS
 LOG = logging.getLogger(__name__)
@@ -68,9 +56,12 @@ authorize = extensions.extension_authorizer('compute', 'os-tenant-networks')
 
 
 def network_dict(network):
-    return {"id": network.get("uuid") or network.get("id"),
-                        "cidr": str(network.get("cidr")),
-                        "label": network.get("label")}
+    # NOTE(danms): Here, network should be an object, which could have come
+    # from neutron and thus be missing most of the attributes. Providing a
+    # default to get() avoids trying to lazy-load missing attributes.
+    return {"id": network.get("uuid", None) or network.get("id", None),
+                        "cidr": str(network.get("cidr", None)),
+                        "label": network.get("label", None)}
 
 
 class NetworkController(object):
@@ -107,7 +98,7 @@ class NetworkController(object):
     def show(self, req, id):
         context = req.environ['nova.context']
         authorize(context)
-        LOG.debug("Showing network with id %s", id)
+
         try:
             network = self.network_api.get(context, id)
         except exception.NetworkNotFound:
@@ -126,8 +117,6 @@ class NetworkController(object):
             reservation = None
             LOG.exception(_LE("Failed to update usages deallocating "
                               "network."))
-
-        LOG.info(_LI("Deleting network with id %s"), id)
 
         def _rollback_quota(reservation):
             if CONF.enable_network_quota and reservation:
@@ -162,8 +151,11 @@ class NetworkController(object):
         network = body["network"]
         keys = ["cidr", "cidr_v6", "ipam", "vlan_start", "network_size",
                 "num_networks"]
-        kwargs = dict((k, network.get(k)) for k in keys)
+        kwargs = {k: network.get(k) for k in keys}
 
+        if not network.get("label"):
+            msg = _("Network label is required")
+            raise exc.HTTPBadRequest(explanation=msg)
         label = network["label"]
 
         if not (kwargs["cidr"] or kwargs["cidr_v6"]):

@@ -18,11 +18,11 @@ import itertools
 import string
 import traceback
 
-from oslo.config import cfg
-from oslo.utils import encodeutils
+import netifaces
+from oslo_config import cfg
+from oslo_log import log
 
 from nova import block_device
-from nova.compute import flavors
 from nova.compute import power_state
 from nova.compute import task_states
 from nova import exception
@@ -30,8 +30,6 @@ from nova.i18n import _LW
 from nova.network import model as network_model
 from nova import notifications
 from nova import objects
-from nova.objects import base as obj_base
-from nova.openstack.common import log
 from nova import rpc
 from nova import utils
 from nova.virt import driver
@@ -65,20 +63,7 @@ def exception_to_dict(fault):
     # NOTE(dripton) The message field in the database is limited to 255 chars.
     # MySQL silently truncates overly long messages, but PostgreSQL throws an
     # error if we don't truncate it.
-    b_message = encodeutils.safe_encode(message)[:255]
-
-    # NOTE(chaochin) UTF-8 character byte size varies from 1 to 6. If
-    # truncating a long byte string to 255, the last character may be
-    # cut in the middle, so that UnicodeDecodeError will occur when
-    # converting it back to unicode.
-    decode_ok = False
-    while not decode_ok:
-        try:
-            u_message = encodeutils.safe_decode(b_message)
-            decode_ok = True
-        except UnicodeDecodeError:
-            b_message = b_message[:-1]
-
+    u_message = utils.safe_truncate(message, 255)
     fault_dict = dict(exception=fault)
     fault_dict["message"] = u_message
     fault_dict["code"] = code
@@ -99,7 +84,7 @@ def add_instance_fault_from_exc(context, instance, fault, exc_info=None):
 
     fault_obj = objects.InstanceFault(context=context)
     fault_obj.host = CONF.host
-    fault_obj.instance_uuid = instance['uuid']
+    fault_obj.instance_uuid = instance.uuid
     fault_obj.update(exception_to_dict(fault))
     code = fault_obj.code
     fault_obj.details = _get_fault_details(exc_info, code)
@@ -148,6 +133,8 @@ def get_next_device_name(instance, device_name_list,
     /dev/vdc is specified but the backend uses /dev/xvdc), the device
     name will be converted to the appropriate format.
     """
+    is_xen = driver.compute_driver_matches('xenapi.XenAPIDriver')
+
     req_prefix = None
     req_letter = None
 
@@ -167,7 +154,7 @@ def get_next_device_name(instance, device_name_list,
         raise exception.InvalidDevicePath(path=root_device_name)
 
     # NOTE(vish): remove this when xenapi is setting default_root_device
-    if driver.compute_driver_matches('xenapi.XenAPIDriver'):
+    if is_xen:
         prefix = '/dev/xvd'
 
     if driver.compute_driver_matches('libvirt.LibvirtDriver'):
@@ -186,12 +173,12 @@ def get_next_device_name(instance, device_name_list,
 
     # NOTE(vish): remove this when xenapi is properly setting
     #             default_ephemeral_device and default_swap_device
-    if driver.compute_driver_matches('xenapi.XenAPIDriver'):
-        flavor = flavors.extract_flavor(instance)
-        if flavor['ephemeral_gb']:
+    if is_xen:
+        flavor = instance.get_flavor()
+        if flavor.ephemeral_gb:
             used_letters.add('b')
 
-        if flavor['swap']:
+        if flavor.swap:
             used_letters.add('c')
 
     if not req_letter:
@@ -214,19 +201,22 @@ def _get_unused_letter(used_letters):
 
 
 def get_image_metadata(context, image_api, image_id_or_uri, instance):
-    # If the base image is still available, get its metadata
-    try:
-        image = image_api.get(context, image_id_or_uri)
-    except (exception.ImageNotAuthorized,
-            exception.ImageNotFound,
-            exception.Invalid) as e:
-        LOG.warning(_LW("Can't access image %(image_id)s: %(error)s"),
-                    {"image_id": image_id_or_uri, "error": e},
-                    instance=instance)
-        image_system_meta = {}
-    else:
-        flavor = flavors.extract_flavor(instance)
-        image_system_meta = utils.get_system_metadata_from_image(image, flavor)
+    image_system_meta = {}
+    # In case of boot from volume, image_id_or_uri may be None or ''
+    if image_id_or_uri is not None and image_id_or_uri != '':
+        # If the base image is still available, get its metadata
+        try:
+            image = image_api.get(context, image_id_or_uri)
+        except (exception.ImageNotAuthorized,
+                exception.ImageNotFound,
+                exception.Invalid) as e:
+            LOG.warning(_LW("Can't access image %(image_id)s: %(error)s"),
+                        {"image_id": image_id_or_uri, "error": e},
+                        instance=instance)
+        else:
+            flavor = instance.get_flavor()
+            image_system_meta = utils.get_system_metadata_from_image(image,
+                                                                     flavor)
 
     # Get the system metadata from the instance
     system_meta = utils.instance_sys_meta(instance)
@@ -333,6 +323,17 @@ def notify_about_instance_usage(notifier, context, instance, event_suffix,
     method(context, 'compute.instance.%s' % event_suffix, usage_info)
 
 
+def notify_about_server_group_update(context, event_suffix, sg_payload):
+    """Send a notification about server group update.
+
+    :param event_suffix: Event type like "create.start" or "create.end"
+    :param sg_payload: payload for server group update
+    """
+    notifier = rpc.get_notifier(service='servergroup')
+
+    notifier.info(context, 'servergroup.%s' % event_suffix, sg_payload)
+
+
 def notify_about_aggregate_update(context, event_suffix, aggregate_payload):
     """Send a notification about aggregate update.
 
@@ -363,8 +364,8 @@ def notify_about_host_update(context, event_suffix, host_payload):
     """
     host_identifier = host_payload.get('host_name')
     if not host_identifier:
-        LOG.warn(_LW("No host name specified for the notification of "
-                   "HostAPI.%s and it will be ignored"), event_suffix)
+        LOG.warning(_LW("No host name specified for the notification of "
+                        "HostAPI.%s and it will be ignored"), event_suffix)
         return
 
     notifier = rpc.get_notifier(service='api', host=host_identifier)
@@ -373,16 +374,9 @@ def notify_about_host_update(context, event_suffix, host_payload):
 
 
 def get_nw_info_for_instance(instance):
-    if isinstance(instance, obj_base.NovaObject):
-        if instance.info_cache is None:
-            return network_model.NetworkInfo.hydrate([])
-        return instance.info_cache.network_info
-    # FIXME(comstud): Transitional while we convert to objects.
-    info_cache = instance['info_cache'] or {}
-    nw_info = info_cache.get('network_info') or []
-    if not isinstance(nw_info, network_model.NetworkInfo):
-        nw_info = network_model.NetworkInfo.hydrate(nw_info)
-    return nw_info
+    if instance.info_cache is None:
+        return network_model.NetworkInfo.hydrate([])
+    return instance.info_cache.network_info
 
 
 def has_audit_been_run(context, conductor, host, timestamp=None):
@@ -449,6 +443,31 @@ def get_reboot_type(task_state, current_power_state):
     return reboot_type
 
 
+def get_machine_ips():
+    """Get the machine's ip addresses
+
+    :returns: list of Strings of ip addresses
+    """
+    addresses = []
+    for interface in netifaces.interfaces():
+        try:
+            iface_data = netifaces.ifaddresses(interface)
+            for family in iface_data:
+                if family not in (netifaces.AF_INET, netifaces.AF_INET6):
+                    continue
+                for address in iface_data[family]:
+                    addr = address['addr']
+
+                    # If we have an ipv6 address remove the
+                    # %ether_interface at the end
+                    if family == netifaces.AF_INET6:
+                        addr = addr.split('%')[0]
+                    addresses.append(addr)
+        except ValueError:
+            pass
+    return addresses
+
+
 class EventReporter(object):
     """Context manager to report instance action events."""
 
@@ -472,29 +491,13 @@ class EventReporter(object):
         return False
 
 
-def periodic_task_spacing_warn(config_option_name):
-    """Decorator to warn about an upcoming breaking change in methods which
-    use the @periodic_task decorator.
+class UnlimitedSemaphore(object):
+    def __enter__(self):
+        pass
 
-    Some methods using the @periodic_task decorator specify spacing=0 or
-    None to mean "do not call this method", but the decorator itself uses
-    0/None to mean "call at the default rate".
+    def __exit__(self):
+        pass
 
-    Starting with the K release the Nova methods will be changed to conform
-    to the Oslo decorator.  This decorator should be present wherever a
-    spacing value from user-supplied config is passed to @periodic_task, and
-    there is also a check to skip the method if the value is zero.  It will
-    log a warning if the spacing value from config is 0/None.
-    """
-    # TODO(gilliard) remove this decorator, its usages and the early returns
-    # near them after the K release.
-    def wrapper(f):
-        if (hasattr(f, "_periodic_spacing") and
-                (f._periodic_spacing == 0 or f._periodic_spacing is None)):
-            LOG.warning(_LW("Value of 0 or None specified for %s."
-                " This behaviour will change in meaning in the K release, to"
-                " mean 'call at the default rate' rather than 'do not call'."
-                " To keep the 'do not call' behaviour, use a negative value."),
-                config_option_name)
-        return f
-    return wrapper
+    @property
+    def balance(self):
+        return 0

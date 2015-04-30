@@ -21,14 +21,14 @@ Handling of VM disk images.
 
 import os
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
 from nova import exception
-from nova.i18n import _
+from nova.i18n import _, _LE
 from nova import image
 from nova.openstack.common import fileutils
 from nova.openstack.common import imageutils
-from nova.openstack.common import log as logging
 from nova import utils
 
 LOG = logging.getLogger(__name__)
@@ -48,6 +48,10 @@ def qemu_img_info(path):
     """Return an object containing the parsed output from qemu-img info."""
     # TODO(mikal): this code should not be referring to a libvirt specific
     # flag.
+    # NOTE(sirp): The config option import must go here to avoid an import
+    # cycle
+    CONF.import_opt('images_type', 'nova.virt.libvirt.imagebackend',
+                    group='libvirt')
     if not os.path.exists(path) and CONF.libvirt.images_type != 'rbd':
         msg = (_("Path does not exist %(path)s") % {'path': path})
         raise exception.InvalidDiskInfo(reason=msg)
@@ -71,6 +75,10 @@ def convert_image(source, dest, out_format, run_as_root=False):
 def fetch(context, image_href, path, _user_id, _project_id, max_size=0):
     with fileutils.remove_path_on_error(path):
         IMAGE_API.download(context, image_href, dest_path=path)
+
+
+def get_info(context, image_href):
+    return IMAGE_API.get(context, image_href)
 
 
 def fetch_to_raw(context, image_href, path, user_id, project_id, max_size=0):
@@ -103,11 +111,11 @@ def fetch_to_raw(context, image_href, path, user_id, project_id, max_size=0):
         # irrespective of whether the base image was prepared or not.
         disk_size = data.virtual_size
         if max_size and max_size < disk_size:
-            msg = _('%(base)s virtual size %(disk_size)s '
-                    'larger than flavor root disk size %(size)s')
-            LOG.error(msg % {'base': path,
-                             'disk_size': disk_size,
-                             'size': max_size})
+            LOG.error(_LE('%(base)s virtual size %(disk_size)s '
+                          'larger than flavor root disk size %(size)s'),
+                      {'base': path,
+                       'disk_size': disk_size,
+                       'size': max_size})
             raise exception.FlavorDiskTooSmall()
 
         if fmt != "raw" and CONF.force_raw_images:

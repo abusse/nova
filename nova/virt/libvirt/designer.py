@@ -19,7 +19,7 @@ This module provides helper APIs for populating the config.py
 classes based on common operational needs / policies
 """
 
-from nova.pci import pci_utils
+from nova.pci import utils as pci_utils
 
 
 def set_vif_guest_frontend_config(conf, mac, model, driver):
@@ -126,7 +126,7 @@ def set_vif_host_backend_hw_veb(conf, net_type, devname, vlan,
     else:
         conf.source_dev = devname
         conf.model = None
-    conf.vlan = vlan
+        conf.vlan = vlan
     if tapname:
         conf.target_dev = tapname
 
@@ -140,6 +140,16 @@ def set_vif_host_backend_direct_config(conf, devname):
     conf.source_mode = "passthrough"
     conf.source_dev = devname
     conf.model = "virtio"
+
+
+def set_vif_host_backend_vhostuser_config(conf, mode, path):
+    """Populate a LibvirtConfigGuestInterface instance
+    with host backend details for vhostuser socket.
+    """
+    conf.net_type = "vhostuser"
+    conf.vhostuser_type = "unix"
+    conf.vhostuser_mode = mode
+    conf.vhostuser_path = path
 
 
 def set_vif_bandwidth_config(conf, inst_type):

@@ -37,8 +37,7 @@ class DeferredDeleteController(wsgi.Controller):
         """Restore a previously deleted instance."""
         context = req.environ["nova.context"]
         authorize(context)
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
 
         try:
             self.compute_api.restore(context, instance)
@@ -46,7 +45,7 @@ class DeferredDeleteController(wsgi.Controller):
             raise webob.exc.HTTPForbidden(explanation=error.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                    'restore')
+                    'restore', id)
         return webob.Response(status_int=202)
 
     @wsgi.action('forceDelete')
@@ -54,8 +53,7 @@ class DeferredDeleteController(wsgi.Controller):
         """Force delete of instance before deferred cleanup."""
         context = req.environ["nova.context"]
         authorize(context)
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
 
         try:
             self.compute_api.force_delete(context, instance)

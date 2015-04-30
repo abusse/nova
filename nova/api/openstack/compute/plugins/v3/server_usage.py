@@ -15,12 +15,10 @@
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova import compute
-from nova.openstack.common import log as logging
 
-LOG = logging.getLogger(__name__)
 
 ALIAS = "os-server-usage"
-authorize = extensions.soft_extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_soft_authorizer(ALIAS)
 
 resp_topic = "OS-SRV-USG"
 

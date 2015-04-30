@@ -57,17 +57,18 @@ from __future__ import print_function
 import argparse
 import os
 import sys
+import urllib
 
 import decorator
 import netaddr
-from oslo.config import cfg
-from oslo.db import exception as db_exc
-from oslo import messaging
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging as messaging
+from oslo_utils import importutils
 import six
 
 from nova.api.ec2 import ec2utils
 from nova import availability_zones
-from nova.compute import flavors
 from nova import config
 from nova import context
 from nova import db
@@ -76,8 +77,6 @@ from nova import exception
 from nova.i18n import _
 from nova import objects
 from nova.openstack.common import cliutils
-from nova.openstack.common import importutils
-from nova.openstack.common import log as logging
 from nova import quota
 from nova import rpc
 from nova import servicegroup
@@ -179,13 +178,20 @@ class ShellCommands(object):
                 shell = 'ipython'
         if shell == 'ipython':
             try:
-                import IPython
-                # Explicitly pass an empty list as arguments, because
-                # otherwise IPython would use sys.argv from this script.
-                shell = IPython.Shell.IPShell(argv=[])
-                shell.mainloop()
+                from IPython import embed
+                embed()
             except ImportError:
-                shell = 'python'
+                try:
+                    # Ipython < 0.11
+                    # Explicitly pass an empty list as arguments, because
+                    # otherwise IPython would use sys.argv from this script.
+                    import IPython
+
+                    shell = IPython.Shell.IPShell(argv=[])
+                    shell.mainloop()
+                except ImportError:
+                    # no IPython module
+                    shell = 'python'
 
         if shell == 'python':
             import code
@@ -439,10 +445,10 @@ class FloatingIpCommands(object):
         if not interface:
             interface = CONF.public_interface
 
-        ips = ({'address': str(address), 'pool': pool, 'interface': interface}
-               for address in self.address_to_hosts(ip_range))
+        ips = [{'address': str(address), 'pool': pool, 'interface': interface}
+               for address in self.address_to_hosts(ip_range)]
         try:
-            db.floating_ip_bulk_create(admin_context, ips)
+            db.floating_ip_bulk_create(admin_context, ips, want_result=False)
         except exception.FloatingIpExists as exc:
             # NOTE(simplylizz): Maybe logging would be better here
             # instead of printing, but logging isn't used here and I
@@ -537,8 +543,8 @@ class NetworkCommands(object):
                dns1=None, dns2=None, project_id=None, priority=None,
                uuid=None, fixed_cidr=None):
         """Creates fixed ips for host by range."""
-        kwargs = dict(((k, v) for k, v in locals().iteritems()
-                       if v and k != "self"))
+        kwargs = {k: v for k, v in locals().iteritems()
+                  if v and k != "self"}
         if multi_host is not None:
             kwargs['multi_host'] = multi_host == 'T'
         net_manager = importutils.import_object(CONF.network_manager)
@@ -668,26 +674,27 @@ class VmCommands(object):
                                              _('index'))))
 
         if host is None:
-            instances = db.instance_get_all(context.get_admin_context())
+            instances = objects.InstanceList.get_by_filters(
+                context.get_admin_context(), {}, expected_attrs=['flavor'])
         else:
-            instances = db.instance_get_all_by_host(
-                           context.get_admin_context(), host)
+            instances = objects.InstanceList.get_by_host(
+                context.get_admin_context(), host, expected_attrs=['flavor'])
 
         for instance in instances:
-            instance_type = flavors.extract_flavor(instance)
+            instance_type = instance.get_flavor()
             print(("%-10s %-15s %-10s %-10s %-26s %-9s %-9s %-9s"
-                   " %-10s %-10s %-10s %-5d" % (instance['display_name'],
-                                                instance['host'],
-                                                instance_type['name'],
-                                                instance['vm_state'],
-                                                instance['launched_at'],
-                                                instance['image_ref'],
-                                                instance['kernel_id'],
-                                                instance['ramdisk_id'],
-                                                instance['project_id'],
-                                                instance['user_id'],
-                                                instance['availability_zone'],
-                                                instance['launch_index'])))
+                   " %-10s %-10s %-10s %-5d" % (instance.display_name,
+                                                instance.host,
+                                                instance_type.name,
+                                                instance.vm_state,
+                                                instance.launched_at,
+                                                instance.image_ref,
+                                                instance.kernel_id,
+                                                instance.ramdisk_id,
+                                                instance.project_id,
+                                                instance.user_id,
+                                                instance.availability_zone,
+                                                instance.launch_index or 0)))
 
 
 class ServiceCommands(object):
@@ -731,7 +738,7 @@ class ServiceCommands(object):
         """Enable scheduling for a service."""
         ctxt = context.get_admin_context()
         try:
-            svc = db.service_get_by_args(ctxt, host, service)
+            svc = db.service_get_by_host_and_binary(ctxt, host, service)
             db.service_update(ctxt, svc['id'], {'disabled': False})
         except exception.NotFound as ex:
             print(_("error: %s") % ex)
@@ -745,7 +752,7 @@ class ServiceCommands(object):
         """Disable scheduling for a service."""
         ctxt = context.get_admin_context()
         try:
-            svc = db.service_get_by_args(ctxt, host, service)
+            svc = db.service_get_by_host_and_binary(ctxt, host, service)
             db.service_update(ctxt, svc['id'], {'disabled': True})
         except exception.NotFound as ex:
             print(_("error: %s") % ex)
@@ -768,18 +775,21 @@ class ServiceCommands(object):
 
         """
         # Getting compute node info and related instances info
-        service_ref = db.service_get_by_compute_host(context, host)
+        service_ref = objects.Service.get_by_compute_host(context, host)
         instance_refs = db.instance_get_all_by_host(context,
-                                                    service_ref['host'])
+                                                    service_ref.host)
 
         # Getting total available/used resource
-        compute_ref = service_ref['compute_node'][0]
-        resource = {'vcpus': compute_ref['vcpus'],
-                    'memory_mb': compute_ref['memory_mb'],
-                    'local_gb': compute_ref['local_gb'],
-                    'vcpus_used': compute_ref['vcpus_used'],
-                    'memory_mb_used': compute_ref['memory_mb_used'],
-                    'local_gb_used': compute_ref['local_gb_used']}
+        # NOTE(sbauza): We're lazily loading the compute_node field here but
+        # we will change that later to get the ComputeNode object by using
+        # the Service host field
+        compute_ref = service_ref.compute_node
+        resource = {'vcpus': compute_ref.vcpus,
+                    'memory_mb': compute_ref.memory_mb,
+                    'local_gb': compute_ref.local_gb,
+                    'vcpus_used': compute_ref.vcpus_used,
+                    'memory_mb_used': compute_ref.memory_mb_used,
+                    'local_gb_used': compute_ref.local_gb_used}
         usage = dict()
         if not instance_refs:
             return {'resource': resource, 'usage': usage}
@@ -891,7 +901,7 @@ class HostCommands(object):
 
 
 class DbCommands(object):
-    """Class for managing the database."""
+    """Class for managing the main database."""
 
     def __init__(self):
         pass
@@ -919,141 +929,65 @@ class DbCommands(object):
         admin_context = context.get_admin_context()
         db.archive_deleted_rows(admin_context, max_rows)
 
+    @args('--delete', action='store_true', dest='delete',
+          help='If specified, automatically delete any records found where '
+               'instance_uuid is NULL.')
+    def null_instance_uuid_scan(self, delete=False):
+        """Lists and optionally deletes database records where
+        instance_uuid is NULL.
+        """
+        hits = migration.db_null_instance_uuid_scan(delete)
+        records_found = False
+        for table_name, records in six.iteritems(hits):
+            # Don't print anything for 0 hits
+            if records:
+                records_found = True
+                if delete:
+                    print(_("Deleted %(records)d records "
+                            "from table '%(table_name)s'.") %
+                          {'records': records, 'table_name': table_name})
+                else:
+                    print(_("There are %(records)d records in the "
+                            "'%(table_name)s' table where the uuid or "
+                            "instance_uuid column is NULL. Run this "
+                            "command again with the --delete option after you "
+                            "have backed up any necessary data.") %
+                          {'records': records, 'table_name': table_name})
+        # check to see if we didn't find anything
+        if not records_found:
+            print(_('There were no records found where '
+                    'instance_uuid was NULL.'))
 
-class FlavorCommands(object):
-    """Class for managing flavors.
+    @args('--max-number', metavar='<number>',
+          help='Maximum number of instances to consider')
+    def migrate_flavor_data(self, max_number):
+        if max_number is not None:
+            max_number = int(max_number)
+            if max_number < 0:
+                print(_('Must supply a positive value for max_number'))
+                return(1)
+        admin_context = context.get_admin_context()
+        flavor_cache = {}
+        match, done = db.migrate_flavor_data(admin_context, max_number,
+                                             flavor_cache)
+        print(_('%(total)i instances matched query, %(done)i completed'),
+              {'total': match, 'done': done})
 
-    Note instance type is a deprecated synonym for flavor.
-    """
 
-    description = ('DEPRECATED: Use the nova flavor-* commands from '
-                   'python-novaclient instead. The flavor subcommand will be '
-                   'removed in the 2015.1 release')
+class ApiDbCommands(object):
+    """Class for managing the api database."""
 
-    def _print_flavors(self, val):
-        is_public = ('private', 'public')[val["is_public"] == 1]
-        print(("%s: Memory: %sMB, VCPUS: %s, Root: %sGB, Ephemeral: %sGb, "
-            "FlavorID: %s, Swap: %sMB, RXTX Factor: %s, %s, ExtraSpecs %s") % (
-            val["name"], val["memory_mb"], val["vcpus"], val["root_gb"],
-            val["ephemeral_gb"], val["flavorid"], val["swap"],
-            val["rxtx_factor"], is_public, val["extra_specs"]))
+    def __init__(self):
+        pass
 
-    @args('--name', metavar='<name>',
-            help='Name of flavor')
-    @args('--memory', metavar='<memory size>', help='Memory size')
-    @args('--cpu', dest='vcpus', metavar='<num cores>', help='Number cpus')
-    @args('--root_gb', metavar='<root_gb>', help='Root disk size')
-    @args('--ephemeral_gb', metavar='<ephemeral_gb>',
-            help='Ephemeral disk size')
-    @args('--flavor', dest='flavorid', metavar='<flavor  id>',
-            help='Flavor ID')
-    @args('--swap', metavar='<swap>', help='Swap')
-    @args('--rxtx_factor', metavar='<rxtx_factor>', help='rxtx_factor')
-    @args('--is_public', metavar='<is_public>',
-            help='Make flavor accessible to the public')
-    def create(self, name, memory, vcpus, root_gb, ephemeral_gb=0,
-               flavorid=None, swap=0, rxtx_factor=1.0, is_public=True):
-        """Creates flavors."""
-        try:
-            flavors.create(name, memory, vcpus, root_gb,
-                           ephemeral_gb=ephemeral_gb, flavorid=flavorid,
-                           swap=swap, rxtx_factor=rxtx_factor,
-                           is_public=is_public)
-        except exception.InvalidInput as e:
-            print(_("Must supply valid parameters to create flavor"))
-            print(e)
-            return 1
-        except exception.FlavorExists:
-            print(_("Flavor exists."))
-            print(_("Please ensure flavor name and flavorid are "
-                    "unique."))
-            print(_("Currently defined flavor names and flavorids:"))
-            print()
-            self.list()
-            return 2
-        except Exception:
-            print(_("Unknown error"))
-            return 3
-        else:
-            print(_("%s created") % name)
+    @args('--version', metavar='<version>', help='Database version')
+    def sync(self, version=None):
+        """Sync the database up to the most recent version."""
+        return migration.db_sync(version, database='api')
 
-    @args('--name', metavar='<name>', help='Name of flavor')
-    def delete(self, name):
-        """Marks flavors as deleted."""
-        try:
-            flavors.destroy(name)
-        except exception.FlavorNotFound:
-            print(_("Valid flavor name is required"))
-            return 1
-        except db_exc.DBError as e:
-            print(_("DB Error: %s") % e)
-            return(2)
-        except Exception:
-            return(3)
-        else:
-            print(_("%s deleted") % name)
-
-    @args('--name', metavar='<name>', help='Name of flavor')
-    def list(self, name=None):
-        """Lists all active or specific flavors."""
-        try:
-            if name is None:
-                inst_types = flavors.get_all_flavors()
-            else:
-                inst_types = flavors.get_flavor_by_name(name)
-        except db_exc.DBError as e:
-            _db_error(e)
-        if isinstance(inst_types.values()[0], dict):
-            for k, v in inst_types.iteritems():
-                self._print_flavors(v)
-        else:
-            self._print_flavors(inst_types)
-
-    @args('--name', metavar='<name>', help='Name of flavor')
-    @args('--key', metavar='<key>', help='The key of the key/value pair')
-    @args('--value', metavar='<value>', help='The value of the key/value pair')
-    def set_key(self, name, key, value=None):
-        """Add key/value pair to specified flavor's extra_specs."""
-        try:
-            try:
-                inst_type = flavors.get_flavor_by_name(name)
-            except exception.FlavorNotFoundByName as e:
-                print(e)
-                return(2)
-
-            ctxt = context.get_admin_context()
-            ext_spec = {key: value}
-            db.flavor_extra_specs_update_or_create(
-                            ctxt,
-                            inst_type["flavorid"],
-                            ext_spec)
-            print((_("Key %(key)s set to %(value)s on instance "
-                     "type %(name)s") %
-                   {'key': key, 'value': value, 'name': name}))
-        except db_exc.DBError as e:
-            _db_error(e)
-
-    @args('--name', metavar='<name>', help='Name of flavor')
-    @args('--key', metavar='<key>', help='The key to be deleted')
-    def unset_key(self, name, key):
-        """Delete the specified extra spec for flavor."""
-        try:
-            try:
-                inst_type = flavors.get_flavor_by_name(name)
-            except exception.FlavorNotFoundByName as e:
-                print(e)
-                return(2)
-
-            ctxt = context.get_admin_context()
-            db.flavor_extra_specs_delete(
-                        ctxt,
-                        inst_type["flavorid"],
-                        key)
-
-            print((_("Key %(key)s on flavor %(name)s unset") %
-                   {'key': key, 'name': name}))
-        except db_exc.DBError as e:
-            _db_error(e)
+    def version(self):
+        """Print the current database version."""
+        print(migration.db_version(database='api'))
 
 
 class AgentBuildCommands(object):
@@ -1196,13 +1130,58 @@ class GetLogCommands(object):
 class CellCommands(object):
     """Commands for managing cells."""
 
+    def _create_transport_hosts(self, username, password,
+                                broker_hosts=None, hostname=None, port=None):
+        """Returns a list of oslo.messaging.TransportHost objects."""
+        transport_hosts = []
+        # Either broker-hosts or hostname should be set
+        if broker_hosts:
+            hosts = broker_hosts.split(',')
+            for host in hosts:
+                host = host.strip()
+                broker_hostname, broker_port = utils.parse_server_string(host)
+                if not broker_port:
+                    msg = _('Invalid broker_hosts value: %s. It should be'
+                            ' in hostname:port format') % host
+                    raise ValueError(msg)
+                try:
+                    broker_port = int(broker_port)
+                except ValueError:
+                    msg = _('Invalid port value: %s. It should be '
+                             'an integer') % broker_port
+                    raise ValueError(msg)
+                transport_hosts.append(
+                               messaging.TransportHost(
+                                   hostname=broker_hostname,
+                                   port=broker_port,
+                                   username=username,
+                                   password=password))
+        else:
+            try:
+                port = int(port)
+            except ValueError:
+                msg = _("Invalid port value: %s. Should be an integer") % port
+                raise ValueError(msg)
+            transport_hosts.append(
+                           messaging.TransportHost(
+                               hostname=hostname,
+                               port=port,
+                               username=username,
+                               password=password))
+        return transport_hosts
+
     @args('--name', metavar='<name>', help='Name for the new cell')
-    @args('--cell_type', metavar='<parent|child>',
-         help='Whether the cell is a parent or child')
+    @args('--cell_type', metavar='<parent|api|child|compute>',
+         help='Whether the cell is parent/api or child/compute')
     @args('--username', metavar='<username>',
          help='Username for the message broker in this cell')
     @args('--password', metavar='<password>',
          help='Password for the message broker in this cell')
+    @args('--broker_hosts', metavar='<broker_hosts>',
+         help='Comma separated list of message brokers in this cell. '
+              'Each Broker is specified as hostname:port with both '
+              'mandatory. This option overrides the --hostname '
+              'and --port options (if provided). ')
     @args('--hostname', metavar='<hostname>',
          help='Address of the message broker in this cell')
     @args('--port', metavar='<number>',
@@ -1211,28 +1190,30 @@ class CellCommands(object):
          help='The virtual host of the message broker in this cell')
     @args('--woffset', metavar='<float>')
     @args('--wscale', metavar='<float>')
-    def create(self, name, cell_type='child', username=None, password=None,
-               hostname=None, port=None, virtual_host=None,
+    def create(self, name, cell_type='child', username=None, broker_hosts=None,
+               password=None, hostname=None, port=None, virtual_host=None,
                woffset=None, wscale=None):
 
-        if cell_type not in ['parent', 'child']:
-            print("Error: cell type must be 'parent' or 'child'")
+        if cell_type not in ['parent', 'child', 'api', 'compute']:
+            print("Error: cell type must be 'parent'/'api' or "
+                "'child'/'compute'")
             return(2)
 
         # Set up the transport URL
-        transport_host = messaging.TransportHost(hostname=hostname,
-                                                 port=int(port),
-                                                 username=username,
-                                                 password=password)
-
+        transport_hosts = self._create_transport_hosts(
+                                                 username, password,
+                                                 broker_hosts, hostname,
+                                                 port)
         transport_url = rpc.get_transport_url()
-        transport_url.hosts.append(transport_host)
+        transport_url.hosts.extend(transport_hosts)
         transport_url.virtual_host = virtual_host
 
-        is_parent = cell_type == 'parent'
+        is_parent = False
+        if cell_type in ['api', 'parent']:
+            is_parent = True
         values = {'name': name,
                   'is_parent': is_parent,
-                  'transport_url': str(transport_url),
+                  'transport_url': urllib.unquote(str(transport_url)),
                   'weight_offset': float(woffset),
                   'weight_scale': float(wscale)}
         ctxt = context.get_admin_context()
@@ -1266,10 +1247,10 @@ class CellCommands(object):
 CATEGORIES = {
     'account': AccountCommands,
     'agent': AgentBuildCommands,
+    'api_db': ApiDbCommands,
     'cell': CellCommands,
     'db': DbCommands,
     'fixed': FixedIpCommands,
-    'flavor': FlavorCommands,
     'floating': FloatingIpCommands,
     'host': HostCommands,
     'logs': GetLogCommands,
@@ -1344,7 +1325,7 @@ def main():
     CONF.register_cli_opt(category_opt)
     try:
         config.parse_args(sys.argv)
-        logging.setup("nova")
+        logging.setup(CONF, "nova")
     except cfg.ConfigFilesNotFoundError:
         cfgfile = CONF.config_file[-1] if CONF.config_file else None
         if cfgfile and not os.access(cfgfile, os.R_OK):

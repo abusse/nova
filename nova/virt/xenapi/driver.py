@@ -16,18 +16,6 @@
 """
 A driver for XenServer or Xen Cloud Platform.
 
-**Related Flags**
-
-:connection_url:  URL for connection to XenServer/Xen Cloud Platform.
-:connection_username:  Username for connection to XenServer/Xen Cloud
-                       Platform (default: root).
-:connection_password:  Password for connection to XenServer/Xen Cloud
-                       Platform.
-:target_host:                the iSCSI Target Host IP address, i.e. the IP
-                             address for the nova-volume host
-:target_port:                iSCSI Target Port, 3260 Default
-:iqn_prefix:                 IQN Prefix, e.g. 'iqn.2010-10.org.openstack'
-
 **Variable Naming Scheme**
 
 - suffix "_ref" for opaque references
@@ -37,13 +25,13 @@ A driver for XenServer or Xen Cloud Platform.
 
 import math
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import units
 import six.moves.urllib.parse as urlparse
 
-from nova.i18n import _
-from nova.openstack.common import jsonutils
-from nova.openstack.common import log as logging
-from nova.openstack.common import units
+from nova.i18n import _, _LE, _LW
 from nova import utils
 from nova.virt import driver
 from nova.virt.xenapi.client import session
@@ -150,7 +138,7 @@ class XenAPIDriver(driver.ComputeDriver):
         try:
             vm_utils.cleanup_attached_vdis(self._session)
         except Exception:
-            LOG.exception(_('Failure while cleaning up attached VDIs'))
+            LOG.exception(_LE('Failure while cleaning up attached VDIs'))
 
     def instance_exists(self, instance):
         """Checks existence of an instance on the host.
@@ -283,7 +271,7 @@ class XenAPIDriver(driver.ComputeDriver):
         return self._vmops.migrate_disk_and_power_off(context, instance,
                     dest, flavor, block_device_info)
 
-    def suspend(self, instance):
+    def suspend(self, context, instance):
         """suspend the specified instance."""
         self._vmops.suspend(instance)
 
@@ -362,7 +350,7 @@ class XenAPIDriver(driver.ComputeDriver):
 
         # we only care about VMs that correspond to a nova-managed
         # instance:
-        imap = dict([(inst['name'], inst['uuid']) for inst in instances])
+        imap = {inst['name']: inst['uuid'] for inst in instances}
         bwcounters = []
 
         # get a dictionary of instance names.  values are dictionaries
@@ -389,19 +377,25 @@ class XenAPIDriver(driver.ComputeDriver):
     def get_volume_connector(self, instance):
         """Return volume connector information."""
         if not self._initiator or not self._hypervisor_hostname:
-            stats = self.get_host_stats(refresh=True)
+            stats = self.host_state.get_host_stats(refresh=True)
             try:
                 self._initiator = stats['host_other-config']['iscsi_iqn']
                 self._hypervisor_hostname = stats['host_hostname']
             except (TypeError, KeyError) as err:
-                LOG.warn(_('Could not determine key: %s') % err,
-                         instance=instance)
+                LOG.warning(_LW('Could not determine key: %s'), err,
+                            instance=instance)
                 self._initiator = None
         return {
-            'ip': self.get_host_ip_addr(),
+            'ip': self._get_block_storage_ip(),
             'initiator': self._initiator,
             'host': self._hypervisor_hostname
         }
+
+    def _get_block_storage_ip(self):
+        # If CONF.my_block_storage_ip is set, use it.
+        if CONF.my_block_storage_ip != CONF.my_ip:
+            return CONF.my_block_storage_ip
+        return self.get_host_ip_addr()
 
     @staticmethod
     def get_host_ip_addr():
@@ -438,7 +432,7 @@ class XenAPIDriver(driver.ComputeDriver):
         :returns: dictionary describing resources
 
         """
-        host_stats = self.get_host_stats(refresh=True)
+        host_stats = self.host_state.get_host_stats(refresh=True)
 
         # Updating host information
         total_ram_mb = host_stats['host_memory_total'] / units.Mi
@@ -458,9 +452,7 @@ class XenAPIDriver(driver.ComputeDriver):
                'hypervisor_type': 'xen',
                'hypervisor_version': hyper_ver,
                'hypervisor_hostname': host_stats['host_hostname'],
-               # Todo(bobba) cpu_info may be in a format not supported by
-               # arch_filter.py - see libvirt/driver.py get_cpu_info
-               'cpu_info': jsonutils.dumps(host_stats['host_cpu_info']),
+               'cpu_info': jsonutils.dumps(host_stats['cpu_model']),
                'disk_available_least': total_disk_gb - allocated_disk_gb,
                'supported_instances': jsonutils.dumps(
                    host_stats['supported_instances']),
@@ -497,12 +489,12 @@ class XenAPIDriver(driver.ComputeDriver):
         """Do required cleanup on dest host after check_can_live_migrate calls
 
         :param context: security context
-        :param disk_over_commit: if true, allow disk over commit
+        :param dest_check_data: result of check_can_live_migrate_destination
         """
         pass
 
     def check_can_live_migrate_source(self, context, instance,
-                                      dest_check_data):
+                                      dest_check_data, block_device_info=None):
         """Check if it is possible to execute live migration.
 
         This checks if the live migration can succeed, based on the
@@ -512,11 +504,12 @@ class XenAPIDriver(driver.ComputeDriver):
         :param instance: nova.db.sqlalchemy.models.Instance
         :param dest_check_data: result of check_can_live_migrate_destination
                                 includes the block_migration flag
+        :param block_device_info: result of _get_instance_block_device_info
         """
         return self._vmops.check_can_live_migrate_source(context, instance,
                                                          dest_check_data)
 
-    def get_instance_disk_info(self, instance_name,
+    def get_instance_disk_info(self, instance,
                                block_device_info=None):
         """Used by libvirt for live migration. We rely on xenapi
         checks to do this for us.
@@ -629,14 +622,11 @@ class XenAPIDriver(driver.ComputeDriver):
     def refresh_provider_fw_rules(self):
         return self._vmops.refresh_provider_fw_rules()
 
-    def get_host_stats(self, refresh=False):
-        """Return the current state of the host.
+    def get_available_nodes(self, refresh=False):
+        stats = self.host_state.get_host_stats(refresh=refresh)
+        return [stats["hypervisor_hostname"]]
 
-           If 'refresh' is True, run the update first.
-         """
-        return self.host_state.get_host_stats(refresh=refresh)
-
-    def host_power_action(self, host, action):
+    def host_power_action(self, action):
         """The only valid values for 'action' on XenServer are 'reboot' or
         'shutdown', even though the API also accepts 'startup'. As this is
         not technically possible on XenServer, since the host is the same
@@ -644,18 +634,18 @@ class XenAPIDriver(driver.ComputeDriver):
         raise an exception.
         """
         if action in ("reboot", "shutdown"):
-            return self._host.host_power_action(host, action)
+            return self._host.host_power_action(action)
         else:
             msg = _("Host startup on XenServer is not supported.")
             raise NotImplementedError(msg)
 
-    def set_host_enabled(self, host, enabled):
+    def set_host_enabled(self, enabled):
         """Sets the compute host's ability to accept new instances."""
         return self._host.set_host_enabled(enabled)
 
-    def get_host_uptime(self, host):
+    def get_host_uptime(self):
         """Returns the result of calling "uptime" on the target host."""
-        return self._host.get_host_uptime(host)
+        return self._host.get_host_uptime()
 
     def host_maintenance_mode(self, host, mode):
         """Start/Stop host maintenance window. On start, it triggers

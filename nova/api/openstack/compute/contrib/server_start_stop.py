@@ -14,16 +14,13 @@
 
 import webob
 
+from nova.api.openstack import common
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova import compute
 from nova import exception
 from nova.i18n import _
 from nova import objects
-from nova.openstack.common import log as logging
-
-
-LOG = logging.getLogger(__name__)
 
 
 class ServerStartStopActionController(wsgi.Controller):
@@ -46,11 +43,13 @@ class ServerStartStopActionController(wsgi.Controller):
         context = req.environ['nova.context']
         instance = self._get_instance(context, id)
         extensions.check_compute_policy(context, 'start', instance)
-        LOG.debug('start instance', instance=instance)
+
         try:
             self.compute_api.start(context, instance)
-        except (exception.InstanceNotReady, exception.InstanceIsLocked,
-                exception.InstanceInvalidState) as e:
+        except exception.InstanceInvalidState as state_error:
+            common.raise_http_conflict_for_instance_invalid_state(state_error,
+                'start', id)
+        except (exception.InstanceNotReady, exception.InstanceIsLocked) as e:
             raise webob.exc.HTTPConflict(explanation=e.format_message())
         return webob.Response(status_int=202)
 
@@ -60,11 +59,13 @@ class ServerStartStopActionController(wsgi.Controller):
         context = req.environ['nova.context']
         instance = self._get_instance(context, id)
         extensions.check_compute_policy(context, 'stop', instance)
-        LOG.debug('stop instance', instance=instance)
+
         try:
             self.compute_api.stop(context, instance)
-        except (exception.InstanceNotReady, exception.InstanceIsLocked,
-                exception.InstanceInvalidState) as e:
+        except exception.InstanceInvalidState as state_error:
+            common.raise_http_conflict_for_instance_invalid_state(state_error,
+                'stop', id)
+        except (exception.InstanceNotReady, exception.InstanceIsLocked) as e:
             raise webob.exc.HTTPConflict(explanation=e.format_message())
         return webob.Response(status_int=202)
 

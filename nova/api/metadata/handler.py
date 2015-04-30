@@ -19,7 +19,8 @@ import hashlib
 import hmac
 import os
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 import six
 import webob.dec
 import webob.exc
@@ -30,12 +31,9 @@ from nova import exception
 from nova.i18n import _
 from nova.i18n import _LE
 from nova.i18n import _LW
-from nova.openstack.common import log as logging
 from nova.openstack.common import memorycache
 from nova import utils
 from nova import wsgi
-
-CACHE_EXPIRATION = 15  # in seconds
 
 CONF = cfg.CONF
 CONF.import_opt('use_forwarded_for', 'nova.api.auth')
@@ -45,19 +43,26 @@ metadata_proxy_opts = [
         'service_metadata_proxy',
         default=False,
         help='Set flag to indicate Neutron will proxy metadata requests and '
-             'resolve instance ids.',
-        deprecated_group='DEFAULT',
-        deprecated_name='service_neutron_metadata_proxy'),
+             'resolve instance ids.'),
      cfg.StrOpt(
          'metadata_proxy_shared_secret',
          default='', secret=True,
-         help='Shared secret to validate proxies Neutron metadata requests',
-         deprecated_group='DEFAULT',
-         deprecated_name='neutron_metadata_proxy_shared_secret')
+         help='Shared secret to validate proxies Neutron metadata requests'),
 ]
 
-# metadata_proxy_opts options in the DEFAULT group were deprecated in Juno
+metadata_opts = [
+    cfg.IntOpt('metadata_cache_expiration',
+               default=15,
+               help='Time in seconds to cache metadata; 0 to disable '
+                    'metadata caching entirely (not recommended). Increasing'
+                    'this should improve response times of the metadata API '
+                    'when under heavy load. Higher values may increase memory'
+                    'usage and result in longer times for host metadata '
+                    'changes to take effect.')
+]
+
 CONF.register_opts(metadata_proxy_opts, 'neutron')
+CONF.register_opts(metadata_opts)
 
 LOG = logging.getLogger(__name__)
 
@@ -76,6 +81,7 @@ class MetadataRequestHandler(wsgi.Application):
         cache_key = 'metadata-%s' % address
         data = self._cache.get(cache_key)
         if data:
+            LOG.debug("Using cached metadata for %s", address)
             return data
 
         try:
@@ -83,7 +89,8 @@ class MetadataRequestHandler(wsgi.Application):
         except exception.NotFound:
             return None
 
-        self._cache.set(cache_key, data, CACHE_EXPIRATION)
+        if CONF.metadata_cache_expiration > 0:
+            self._cache.set(cache_key, data, CONF.metadata_cache_expiration)
 
         return data
 
@@ -91,6 +98,7 @@ class MetadataRequestHandler(wsgi.Application):
         cache_key = 'metadata-%s' % instance_id
         data = self._cache.get(cache_key)
         if data:
+            LOG.debug("Using cached metadata for instance %s", instance_id)
             return data
 
         try:
@@ -99,7 +107,8 @@ class MetadataRequestHandler(wsgi.Application):
         except exception.NotFound:
             return None
 
-        self._cache.set(cache_key, data, CACHE_EXPIRATION)
+        if CONF.metadata_cache_expiration > 0:
+            self._cache.set(cache_key, data, CONF.metadata_cache_expiration)
 
         return data
 
@@ -115,7 +124,7 @@ class MetadataRequestHandler(wsgi.Application):
             meta_data = self._handle_instance_id_request(req)
         else:
             if req.headers.get('X-Instance-ID'):
-                LOG.warn(
+                LOG.warning(
                     _LW("X-Instance-ID present in request headers. The "
                         "'service_metadata_proxy' option must be "
                         "enabled to process this header."))
@@ -149,11 +158,12 @@ class MetadataRequestHandler(wsgi.Application):
         try:
             meta_data = self.get_metadata_by_remote_address(remote_address)
         except Exception:
-            LOG.exception(_('Failed to get metadata for ip: %s'),
+            LOG.exception(_LE('Failed to get metadata for ip: %s'),
                           remote_address)
             msg = _('An unknown error has occurred. '
                     'Please try your request again.')
-            raise webob.exc.HTTPInternalServerError(explanation=unicode(msg))
+            raise webob.exc.HTTPInternalServerError(
+                                               explanation=six.text_type(msg))
 
         if meta_data is None:
             LOG.error(_LE('Failed to get metadata for ip: %s'),
@@ -171,6 +181,8 @@ class MetadataRequestHandler(wsgi.Application):
 
         if instance_id is None:
             msg = _('X-Instance-ID header is missing from request.')
+        elif signature is None:
+            msg = _('X-Instance-ID-Signature header is missing from request.')
         elif tenant_id is None:
             msg = _('X-Tenant-ID header is missing from request.')
         elif not isinstance(instance_id, six.string_types):
@@ -190,14 +202,15 @@ class MetadataRequestHandler(wsgi.Application):
 
         if not utils.constant_time_compare(expected_signature, signature):
             if instance_id:
-                LOG.warn(_LW('X-Instance-ID-Signature: %(signature)s does '
-                             'not match the expected value: '
-                             '%(expected_signature)s for id: %(instance_id)s.'
-                             '  Request From: %(remote_address)s'),
-                         {'signature': signature,
-                          'expected_signature': expected_signature,
-                          'instance_id': instance_id,
-                          'remote_address': remote_address})
+                LOG.warning(_LW('X-Instance-ID-Signature: %(signature)s does '
+                                'not match the expected value: '
+                                '%(expected_signature)s for id: '
+                                '%(instance_id)s. Request From: '
+                                '%(remote_address)s'),
+                            {'signature': signature,
+                             'expected_signature': expected_signature,
+                             'instance_id': instance_id,
+                             'remote_address': remote_address})
 
             msg = _('Invalid proxy request signature.')
             raise webob.exc.HTTPForbidden(explanation=msg)
@@ -206,19 +219,20 @@ class MetadataRequestHandler(wsgi.Application):
             meta_data = self.get_metadata_by_instance_id(instance_id,
                                                          remote_address)
         except Exception:
-            LOG.exception(_('Failed to get metadata for instance id: %s'),
+            LOG.exception(_LE('Failed to get metadata for instance id: %s'),
                           instance_id)
             msg = _('An unknown error has occurred. '
                     'Please try your request again.')
-            raise webob.exc.HTTPInternalServerError(explanation=unicode(msg))
+            raise webob.exc.HTTPInternalServerError(
+                                               explanation=six.text_type(msg))
 
         if meta_data is None:
             LOG.error(_LE('Failed to get metadata for instance id: %s'),
                       instance_id)
-        elif meta_data.instance['project_id'] != tenant_id:
-            LOG.warn(_LW("Tenant_id %(tenant_id)s does not match tenant_id "
-                         "of instance %(instance_id)s."),
-                     {'tenant_id': tenant_id, 'instance_id': instance_id})
+        elif meta_data.instance.project_id != tenant_id:
+            LOG.warning(_LW("Tenant_id %(tenant_id)s does not match tenant_id "
+                            "of instance %(instance_id)s."),
+                        {'tenant_id': tenant_id, 'instance_id': instance_id})
             # causes a 404 to be raised
             meta_data = None
 

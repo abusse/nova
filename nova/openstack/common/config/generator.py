@@ -27,14 +27,10 @@ import socket
 import sys
 import textwrap
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_utils import importutils
 import six
 import stevedore.named
-
-from nova.openstack.common import gettextutils
-from nova.openstack.common import importutils
-
-gettextutils.install('nova')
 
 STROPT = "StrOpt"
 BOOLOPT = "BoolOpt"
@@ -108,7 +104,7 @@ def generate(argv):
     # and the list of Opt instances for that group.
     if parsed_args.libraries:
         loader = stevedore.named.NamedExtensionManager(
-            'oslo.config.opts',
+            'oslo_config.opts',
             names=list(set(parsed_args.libraries)),
             invoke_on_load=False,
             on_load_failure_callback=raise_extension_exception
@@ -183,6 +179,10 @@ def _list_opts(obj):
                 not isinstance(o, cfg.SubCommandOpt))
 
     opts = list()
+
+    if 'list_opts' in dir(obj):
+        return getattr(obj, 'list_opts')()
+
     for attr_str in dir(obj):
         attr_obj = getattr(obj, attr_str)
         if is_opt(attr_obj):
@@ -241,6 +241,14 @@ def _sanitize_default(name, value):
     return value
 
 
+def _get_choice_text(choice):
+    if choice is None:
+        return '<None>'
+    elif choice == '':
+        return "''"
+    return six.text_type(choice)
+
+
 def _print_opt(opt):
     opt_name, opt_default, opt_help = opt.dest, opt.default, opt.help
     if not opt_help:
@@ -268,6 +276,11 @@ def _print_opt(opt):
             print('#%s=<None>' % opt_name)
         elif opt_type == STROPT:
             assert(isinstance(opt_default, six.string_types))
+            if (getattr(opt, 'type', None) and
+                    getattr(opt.type, 'choices', None)):
+                choices_text = ', '.join([_get_choice_text(choice)
+                                          for choice in opt.type.choices])
+                print('# Allowed values: %s' % choices_text)
             print('#%s=%s' % (opt_name, _sanitize_default(opt_name,
                                                           opt_default)))
         elif opt_type == BOOLOPT:

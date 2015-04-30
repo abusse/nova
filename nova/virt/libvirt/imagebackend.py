@@ -15,9 +15,16 @@
 
 import abc
 import contextlib
+import functools
 import os
+import shutil
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import excutils
+from oslo_utils import strutils
+from oslo_utils import units
 import six
 
 from nova import exception
@@ -25,11 +32,7 @@ from nova.i18n import _
 from nova.i18n import _LE, _LI
 from nova import image
 from nova import keymgr
-from nova.openstack.common import excutils
 from nova.openstack.common import fileutils
-from nova.openstack.common import jsonutils
-from nova.openstack.common import log as logging
-from nova.openstack.common import units
 from nova import utils
 from nova.virt.disk import api as disk
 from nova.virt import images
@@ -52,13 +55,6 @@ __imagebackend_opts = [
                 default=False,
                 help='Create sparse logical volumes (with virtualsize)'
                      ' if this flag is set to True.'),
-    cfg.StrOpt('volume_clear',
-               default='zero',
-               help='Method used to wipe old volumes (valid options are: '
-                    'none, zero, shred)'),
-    cfg.IntOpt('volume_clear_size',
-               default=0,
-               help='Size in MiB to wipe at start of old volumes. 0 => all'),
     cfg.StrOpt('images_rbd_pool',
                default='rbd',
                help='The RADOS pool in which rbd volumes are stored'),
@@ -175,6 +171,33 @@ class Image(object):
                     setattr(info, scope[1], value)
         return info
 
+    def libvirt_fs_info(self, target, driver_type=None):
+        """Get `LibvirtConfigGuestFilesys` filled for this image.
+
+        :target: target directory inside a container.
+        :driver_type: filesystem driver type, can be loop
+                      nbd or ploop.
+        """
+        info = vconfig.LibvirtConfigGuestFilesys()
+        info.target_dir = target
+
+        if self.is_block_dev:
+            info.source_type = "block"
+            info.source_dev = self.path
+        else:
+            info.source_type = "file"
+            info.source_file = self.path
+            info.driver_format = self.driver_format
+            if driver_type:
+                info.driver_type = driver_type
+            else:
+                if self.driver_format == "raw":
+                    info.driver_type = "loop"
+                else:
+                    info.driver_type = "nbd"
+
+        return info
+
     def check_image_exists(self):
         return os.path.exists(self.path)
 
@@ -258,7 +281,7 @@ class Image(object):
             raise exception.FlavorDiskTooSmall()
 
     def get_disk_size(self, name):
-        disk.get_disk_size(name)
+        return disk.get_disk_size(name)
 
     def snapshot_extract(self, target, out_format):
         raise NotImplementedError()
@@ -283,7 +306,7 @@ class Image(object):
             except (TypeError, ValueError) as e:
                 msg = (_("Could not load line %(line)s, got error "
                         "%(error)s") %
-                        {'line': line, 'error': unicode(e)})
+                        {'line': line, 'error': e})
                 raise exception.InvalidDiskInfo(reason=msg)
 
         @utils.synchronized(self.disk_info_path, external=False,
@@ -320,7 +343,7 @@ class Image(object):
                 fileutils.ensure_tree(os.path.dirname(self.disk_info_path))
                 write_to_disk_info_file()
         except OSError as e:
-            raise exception.DiskInfoReadWriteFail(reason=unicode(e))
+            raise exception.DiskInfoReadWriteFail(reason=six.text_type(e))
         return driver_format
 
     @staticmethod
@@ -348,6 +371,10 @@ class Image(object):
         raise exception.ImageUnacceptable(image_id=image_id_or_uri,
                                           reason=reason)
 
+    def _get_lock_name(self, base):
+        """Get an image's name of a base file."""
+        return os.path.split(base)[-1]
+
 
 class Raw(Image):
     def __init__(self, instance=None, disk_name=None, path=None):
@@ -357,7 +384,8 @@ class Raw(Image):
         self.path = (path or
                      os.path.join(libvirt_utils.get_instance_path(instance),
                                   disk_name))
-        self.preallocate = CONF.preallocate_images != 'none'
+        self.preallocate = (
+            strutils.to_slug(CONF.preallocate_images) == 'space')
         self.disk_info_path = os.path.join(os.path.dirname(self.path),
                                            'disk.info')
         self.correct_format()
@@ -390,7 +418,7 @@ class Raw(Image):
             self.driver_format = self.resolve_driver_format()
 
     def create_image(self, prepare_template, base, size, *args, **kwargs):
-        filename = os.path.split(base)[-1]
+        filename = self._get_lock_name(base)
 
         @utils.synchronized(filename, external=True, lock_path=self.lock_path)
         def copy_raw_image(base, target, size):
@@ -429,13 +457,14 @@ class Qcow2(Image):
         self.path = (path or
                      os.path.join(libvirt_utils.get_instance_path(instance),
                                   disk_name))
-        self.preallocate = CONF.preallocate_images != 'none'
+        self.preallocate = (
+            strutils.to_slug(CONF.preallocate_images) == 'space')
         self.disk_info_path = os.path.join(os.path.dirname(self.path),
                                            'disk.info')
         self.resolve_driver_format()
 
     def create_image(self, prepare_template, base, size, *args, **kwargs):
-        filename = os.path.split(base)[-1]
+        filename = self._get_lock_name(base)
 
         @utils.synchronized(filename, external=True, lock_path=self.lock_path)
         def copy_qcow2_image(base, target, size):
@@ -449,8 +478,7 @@ class Qcow2(Image):
         # Download the unmodified base image unless we already have a copy.
         if not os.path.exists(base):
             prepare_template(target=base, max_size=size, *args, **kwargs)
-        else:
-            self.verify_base_size(base, size)
+        self.verify_base_size(base, size)
 
         legacy_backing_size = None
         legacy_base = base
@@ -519,7 +547,7 @@ class Lvm(Image):
                                      ' images_volume_group'
                                      ' flag to use LVM images.'))
             self.vg = CONF.libvirt.images_volume_group
-            self.lv = '%s_%s' % (instance['uuid'],
+            self.lv = '%s_%s' % (instance.uuid,
                                  self.escape(disk_name))
             if self.ephemeral_key_uuid is None:
                 self.path = os.path.join('/dev', self.vg, self.lv)
@@ -546,7 +574,9 @@ class Lvm(Image):
                                   CONF.ephemeral_storage_encryption.key_size,
                                   key)
 
-        @utils.synchronized(base, external=True, lock_path=self.lock_path)
+        filename = self._get_lock_name(base)
+
+        @utils.synchronized(filename, external=True, lock_path=self.lock_path)
         def create_lvm_image(base, size):
             base_size = disk.get_disk_size(base)
             self.verify_base_size(base, size, base_size=base_size)
@@ -619,7 +649,7 @@ class Rbd(Image):
             except IndexError:
                 raise exception.InvalidDevicePath(path=path)
         else:
-            self.rbd_name = '%s_%s' % (instance['uuid'], disk_name)
+            self.rbd_name = '%s_%s' % (instance.uuid, disk_name)
 
         if not CONF.libvirt.images_rbd_pool:
             raise RuntimeError(_('You should specify'
@@ -695,13 +725,12 @@ class Rbd(Image):
 
         if not self.check_image_exists():
             prepare_template(target=base, max_size=size, *args, **kwargs)
-        else:
-            self.verify_base_size(base, size)
 
         # prepare_template() may have cloned the image into a new rbd
         # image already instead of downloading it locally
         if not self.check_image_exists():
             self.driver.import_image(base, self.rbd_name)
+        self.verify_base_size(base, size)
 
         if size and size > self.get_disk_size(self.rbd_name):
             self.driver.resize(self.rbd_name, size)
@@ -739,6 +768,64 @@ class Rbd(Image):
                                           reason=reason)
 
 
+class Ploop(Image):
+    def __init__(self, instance=None, disk_name=None, path=None):
+        super(Ploop, self).__init__("file", "ploop", is_block_dev=False)
+
+        self.path = (path or
+                     os.path.join(libvirt_utils.get_instance_path(instance),
+                                  disk_name))
+        self.resolve_driver_format()
+
+    def create_image(self, prepare_template, base, size, *args, **kwargs):
+        filename = os.path.split(base)[-1]
+
+        @utils.synchronized(filename, external=True, lock_path=self.lock_path)
+        def create_ploop_image(base, target, size):
+            image_path = os.path.join(target, "root.hds")
+            libvirt_utils.copy_image(base, image_path)
+            utils.execute('ploop', 'restore-descriptor', '-f', self.pcs_format,
+                          target, image_path)
+            if size:
+                dd_path = os.path.join(self.path, "DiskDescriptor.xml")
+                utils.execute('ploop', 'grow', '-s', '%dK' % (size >> 10),
+                              dd_path, run_as_root=True)
+
+        if not os.path.exists(self.path):
+            if CONF.force_raw_images:
+                self.pcs_format = "raw"
+            else:
+                image_meta = IMAGE_API.get(kwargs["context"],
+                                           kwargs["image_id"])
+                format = image_meta.get("disk_format")
+                if format == "ploop":
+                    self.pcs_format = "expanded"
+                elif format == "raw":
+                    self.pcs_format = "raw"
+                else:
+                    reason = _("PCS doesn't support images in %s format."
+                                " You should either set force_raw_images=True"
+                                " in config or upload an image in ploop"
+                                " or raw format.") % format
+                    raise exception.ImageUnacceptable(
+                                        image_id=kwargs["image_id"],
+                                        reason=reason)
+
+        if not os.path.exists(base):
+            prepare_template(target=base, max_size=size, *args, **kwargs)
+        self.verify_base_size(base, size)
+
+        if os.path.exists(self.path):
+            return
+
+        fileutils.ensure_tree(self.path)
+
+        remove_func = functools.partial(fileutils.delete_if_exists,
+                                        remove=shutil.rmtree)
+        with fileutils.remove_path_on_error(self.path, remove=remove_func):
+            create_ploop_image(base, self.path, size)
+
+
 class Backend(object):
     def __init__(self, use_cow):
         self.BACKEND = {
@@ -746,6 +833,7 @@ class Backend(object):
             'qcow2': Qcow2,
             'lvm': Lvm,
             'rbd': Rbd,
+            'ploop': Ploop,
             'default': Qcow2 if use_cow else Raw
         }
 

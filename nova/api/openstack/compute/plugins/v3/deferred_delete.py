@@ -24,45 +24,42 @@ from nova import compute
 from nova import exception
 
 ALIAS = 'os-deferred-delete'
-authorize = extensions.extension_authorizer('compute',
-                                            'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class DeferredDeleteController(wsgi.Controller):
     def __init__(self, *args, **kwargs):
         super(DeferredDeleteController, self).__init__(*args, **kwargs)
-        self.compute_api = compute.API()
+        self.compute_api = compute.API(skip_policy_check=True)
 
+    @wsgi.response(202)
     @extensions.expected_errors((404, 409, 403))
     @wsgi.action('restore')
     def _restore(self, req, id, body):
         """Restore a previously deleted instance."""
         context = req.environ["nova.context"]
         authorize(context)
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
         try:
             self.compute_api.restore(context, instance)
         except exception.QuotaError as error:
             raise webob.exc.HTTPForbidden(explanation=error.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                    'restore')
-        return webob.Response(status_int=202)
+                    'restore', id)
 
+    @wsgi.response(202)
     @extensions.expected_errors((404, 409))
     @wsgi.action('forceDelete')
     def _force_delete(self, req, id, body):
         """Force delete of instance before deferred cleanup."""
         context = req.environ["nova.context"]
         authorize(context)
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
         try:
             self.compute_api.force_delete(context, instance)
         except exception.InstanceIsLocked as e:
             raise webob.exc.HTTPConflict(explanation=e.format_message())
-        return webob.Response(status_int=202)
 
 
 class DeferredDelete(extensions.V3APIExtensionBase):

@@ -13,12 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 import pkg_resources
 import six.moves.urllib.parse as urlparse
 
 from nova.i18n import _
-import nova.openstack.common.log as logging
 from nova.virt.xenapi import vm_utils
 
 LOG = logging.getLogger(__name__)
@@ -91,7 +91,7 @@ class BittorrentStore(object):
 
         return fn
 
-    def download_image(self, context, session, image_id):
+    def download_image(self, context, session, instance, image_id):
         params = {}
         params['image_id'] = image_id
         params['uuid_stack'] = vm_utils._make_uuid_stack()
@@ -117,5 +117,5 @@ class BittorrentStore(object):
 
         return vdis
 
-    def upload_image(self, context, session, instance, vdi_uuids, image_id):
+    def upload_image(self, context, session, instance, image_id, vdi_uuids):
         raise NotImplementedError

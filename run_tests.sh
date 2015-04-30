@@ -115,9 +115,9 @@ function run_tests {
     if [ "$testropts" = "" ] && [ "$testrargs" = "" ]; then
       # Default to running all tests if specific test is not
       # provided.
-      testrargs="discover ./nova/tests"
+      testrargs="discover ./nova/tests/unit"
     fi
-    ${wrapper} python -m nova.openstack.common.lockutils python -m testtools.run $testropts $testrargs
+    ${wrapper} python -m testtools.run $testropts $testrargs
 
     # Short circuit because all of the testr and coverage stuff
     # below does not make sense when running testtools.run for
@@ -140,7 +140,7 @@ function run_tests {
     ${wrapper} python setup.py egg_info
   fi
   echo "Running \`${wrapper} $TESTRTESTS\`"
-  if ${wrapper} which subunit-2to1 2>&1 > /dev/null
+  if ${wrapper} which subunit-2to1 >/dev/null 2>&1
   then
     # subunit-2to1 is present, testr subunit stream should be in version 2
     # format. Convert to version one before colorizing.
@@ -184,7 +184,7 @@ function run_pep8 {
 }
 
 
-TESTRTESTS="python -m nova.openstack.common.lockutils python setup.py testr"
+TESTRTESTS="python setup.py testr"
 
 if [ $never_venv -eq 0 ]
 then

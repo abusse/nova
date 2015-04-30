@@ -8,7 +8,7 @@ only working with Compute Nodes.
 Filtering
 ---------
 
-.. image:: /images/filteringWorkflow1.png
+.. image:: ../images/filteringWorkflow1.png
 
 During its work Filter Scheduler firstly makes dictionary of unfiltered hosts,
 then filters them using filter properties and finally chooses hosts for the
@@ -32,6 +32,8 @@ There are some standard filter classes to use (:mod:`nova.scheduler.filters`):
   image properties contained in the instance.
 * |AvailabilityZoneFilter| - filters hosts by availability zone. It passes
   hosts matching the availability zone specified in the instance properties.
+  Use a comma to specify multiple zones. The filter will then ensure it matches
+  any zone specified.
 * |ComputeCapabilitiesFilter| - checks that the capabilities provided by the
   host compute service satisfy any extra specifications associated with the
   instance type.  It passes hosts that can create the specified instance type.
@@ -61,16 +63,18 @@ There are some standard filter classes to use (:mod:`nova.scheduler.filters`):
   * s<= (less than or equal to as a string)
   * s< (less than as a string)
   * <in> (substring)
+  * <all-in> (all elements contained in collection)
   * <or> (find one of these)
 
-  Examples are: ">= 5", "s== 2.1.0", "<in> gcc", and "<or> fpu <or> gpu"
+  Examples are: ">= 5", "s== 2.1.0", "<in> gcc", "<all-in> aes mmx", and "<or> fpu <or> gpu"
 
 * |AggregateInstanceExtraSpecsFilter| - checks that the aggregate metadata
   satisfies any extra specifications associated with the instance type (that
   have no scope or are scoped with ``aggregate_instance_extra_specs``).
   It passes hosts that can create the specified instance type.
   The extra specifications can have the same operators as
-  |ComputeCapabilitiesFilter|.
+  |ComputeCapabilitiesFilter|. To specify multiple values for the same key
+  use a comma. E.g., "value1,value2"
 * |ComputeFilter| - passes all hosts that are operational and enabled.
 * |CoreFilter| - filters based on CPU core utilization. It passes hosts with
   sufficient number of CPU cores.
@@ -91,7 +95,7 @@ There are some standard filter classes to use (:mod:`nova.scheduler.filters`):
   different ratio settings), the minimum value will be used.
 * |DiskFilter| - filters hosts by their disk allocation. Only hosts with sufficient
   disk space to host the instance are passed.
-  ``disk_allocation_ration`` setting. It's virtual disk to physical disk
+  ``disk_allocation_ratio`` setting. It's virtual disk to physical disk
   allocation ratio and it's 1.0 by default. The total allow allocated disk size will
   be physical disk multiplied this ratio.
 * |AggregateDiskFilter| - filters hosts by disk allocation with per-aggregate
@@ -146,15 +150,11 @@ There are some standard filter classes to use (:mod:`nova.scheduler.filters`):
 * |ServerGroupAffinityFilter| - This filter works the same way as
   ServerGroupAntiAffinityFilter.  The difference is that when you create the server
   group, you should specify a policy of 'affinity'.
-* |GroupAntiAffinityFilter| - This filter is deprecated in favor of
-  ServerGroupAntiAffinityFilter.  Note that this should not be enabled at the
-  same time as GroupAffinityFilter or neither filter will work properly.
-* |GroupAffinityFilter| - This filter is deprecated in favor of
-  ServerGroupAffinityFilter.  Note that this should not be enabled at the same
-  time as GroupAntiAffinityFilter or neither filter will work properly.
 * |AggregateMultiTenancyIsolation| - isolate tenants in specific aggregates.
+  To specify multiple tenants use a comma. Eg. "tenant1,tenant2"
 * |AggregateImagePropertiesIsolation| - isolates hosts based on image
-  properties and aggregate metadata.
+  properties and aggregate metadata. Use a comma to specify multiple values for the
+  same property. The filter will then ensure at least one value matches.
 * |MetricsFilter| - filters hosts based on metrics weight_setting. Only hosts with
   the available metrics are passed.
 * |NUMATopologyFilter| - filters hosts based on the NUMA topology requested by the
@@ -232,14 +232,6 @@ one of the set of instances uses.
 the network address of the current host is in the same sub network as it was
 defined in the request.
 
-|GroupAntiAffinityFilter| its method ``host_passes`` returns ``True`` if host
-to place the instance on is not in a group of hosts. The group of hosts is
-maintained by a group name. The scheduler hint contains the group name.
-
-|GroupAffinityFilter| its method ``host_passes`` returns ``True`` if host to
-place the instance on is in a group of hosts. The group of hosts is
-maintained by a group name. The scheduler hint contains the group name.
-
 |JsonFilter| - this filter provides the opportunity to write complicated
 queries for the hosts capabilities filtering, based on simple JSON-like syntax.
 There can be used the following operations for the host states properties:
@@ -259,7 +251,9 @@ and at the same time with free disk space greater or equal than 200 GB.
 
 Many filters use data from ``scheduler_hints``, that is defined in the moment of
 creation of the new server for the user. The only exception for this rule is
-|JsonFilter|, that takes data in some strange difficult to understand way.
+|JsonFilter|, that takes data from the schedulers ``HostState`` data structure
+directly. Variable naming, such as the ``$free_ram_mb`` example above, should
+be based on those attributes.
 
 The |RetryFilter| filters hosts that have already been attempted for scheduling.
 It only passes hosts that have not been previously attempted.
@@ -363,13 +357,18 @@ The Filter Scheduler weighs hosts based on the config option
 
     metrics_weight_setting = name1=1.0, name2=-1.0
 
+* |IoOpsWeigher| The weigher can compute the weight based on the compute node
+  host's workload. The default is to preferably choose light workload compute
+  hosts. If the multiplier is positive, the weigher prefer choosing heavy
+  workload compute hosts, the weighing has the opposite effect of the default.
+
 Filter Scheduler finds local list of acceptable hosts by repeated filtering and
 weighing. Each time it chooses a host, it virtually consumes resources on it,
 so subsequent selections can adjust accordingly. It is useful if the customer
 asks for the some large amount of instances, because weight is computed for
 each instance requested.
 
-.. image:: /images/filteringWorkflow2.png
+.. image:: ../images/filteringWorkflow2.png
 
 In the end Filter Scheduler sorts selected hosts by their weight and provisions
 instances on them.
@@ -397,8 +396,6 @@ in :mod:``nova.tests.scheduler``.
 .. |AggregateIoOpsFilter| replace:: :class:`AggregateIoOpsFilter <nova.scheduler.filters.io_ops_filter.AggregateIoOpsFilter>`
 .. |PciPassthroughFilter| replace:: :class:`PciPassthroughFilter <nova.scheduler.filters.pci_passthrough_filter.PciPassthroughFilter>`
 .. |SimpleCIDRAffinityFilter| replace:: :class:`SimpleCIDRAffinityFilter <nova.scheduler.filters.affinity_filter.SimpleCIDRAffinityFilter>`
-.. |GroupAntiAffinityFilter| replace:: :class:`GroupAntiAffinityFilter <nova.scheduler.filters.affinity_filter.GroupAntiAffinityFilter>`
-.. |GroupAffinityFilter| replace:: :class:`GroupAffinityFilter <nova.scheduler.filters.affinity_filter.GroupAffinityFilter>`
 .. |DifferentHostFilter| replace:: :class:`DifferentHostFilter <nova.scheduler.filters.affinity_filter.DifferentHostFilter>`
 .. |SameHostFilter| replace:: :class:`SameHostFilter <nova.scheduler.filters.affinity_filter.SameHostFilter>`
 .. |RetryFilter| replace:: :class:`RetryFilter <nova.scheduler.filters.retry_filter.RetryFilter>`
@@ -414,3 +411,4 @@ in :mod:``nova.tests.scheduler``.
 .. |AggregateImagePropertiesIsolation| replace:: :class:`AggregateImagePropertiesIsolation <nova.scheduler.filters.aggregate_image_properties_isolation.AggregateImagePropertiesIsolation>`
 .. |MetricsFilter| replace:: :class:`MetricsFilter <nova.scheduler.filters.metrics_filter.MetricsFilter>`
 .. |MetricsWeigher| replace:: :class:`MetricsWeigher <nova.scheduler.weights.metrics.MetricsWeigher>`
+.. |IoOpsWeigher| replace:: :class:`IoOpsWeigher <nova.scheduler.weights.io_ops.IoOpsWeigher>`

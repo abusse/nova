@@ -44,7 +44,7 @@ class API(object):
         """Returns a client session that can be used to query for image
         information.
 
-        :param context: The `nova.context.Context` object for the request
+        :param _context: The `nova.context.Context` object for the request
         """
         # TODO(jaypipes): Refactor glance.get_remote_image_service and
         #                 glance.get_default_image_service into a single
@@ -67,7 +67,8 @@ class API(object):
         session = self._get_session(context)
         return session.detail(context, **kwargs)
 
-    def get(self, context, id_or_uri, include_locations=False):
+    def get(self, context, id_or_uri, include_locations=False,
+            show_deleted=True):
         """Retrieves the information record for a single disk image. If the
         supplied identifier parameter is a UUID, the default driver will
         be used to return information about the image. If the supplied
@@ -83,10 +84,13 @@ class API(object):
                                   not support the locations attribute, it will
                                   still be included in the returned dict, as an
                                   empty list.
+        :param show_deleted: (Optional) show the image even the status of
+                             image is deleted.
         """
         session, image_id = self._get_session_and_image_id(context, id_or_uri)
         return session.show(context, image_id,
-                            include_locations=include_locations)
+                            include_locations=include_locations,
+                            show_deleted=show_deleted)
 
     def create(self, context, image_info, data=None):
         """Creates a new image record, optionally passing the image bits to

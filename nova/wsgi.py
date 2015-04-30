@@ -27,16 +27,17 @@ import sys
 import eventlet
 import eventlet.wsgi
 import greenlet
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_log import loggers
+from oslo_utils import excutils
 from paste import deploy
 import routes.middleware
 import webob.dec
 import webob.exc
 
 from nova import exception
-from nova.i18n import _
-from nova.openstack.common import excutils
-from nova.openstack.common import log as logging
+from nova.i18n import _, _LE, _LI
 
 wsgi_opts = [
     cfg.StrOpt('api_paste_config',
@@ -73,7 +74,7 @@ wsgi_opts = [
                 default=True,
                 help="If False, closes the client socket connection "
                      "explicitly."),
-    cfg.IntOpt('client_socket_timeout', default=0,
+    cfg.IntOpt('client_socket_timeout', default=900,
                help="Timeout for client connections' socket operations. "
                     "If an incoming connection is idle for this number of "
                     "seconds it will be closed. A value of '0' means "
@@ -114,7 +115,7 @@ class Server(object):
         self.pool_size = pool_size or self.default_pool_size
         self._pool = eventlet.GreenPool(self.pool_size)
         self._logger = logging.getLogger("nova.%s.wsgi.server" % self.name)
-        self._wsgi_logger = logging.WritableLogger(self._logger)
+        self._wsgi_logger = loggers.WritableLogger(self._logger)
         self._use_ssl = use_ssl
         self._max_url_len = max_url_len
         self.client_socket_timeout = CONF.client_socket_timeout or None
@@ -140,12 +141,12 @@ class Server(object):
         try:
             self._socket = eventlet.listen(bind_addr, family, backlog=backlog)
         except EnvironmentError:
-            LOG.error(_("Could not bind to %(host)s:%(port)s"),
+            LOG.error(_LE("Could not bind to %(host)s:%(port)s"),
                       {'host': host, 'port': port})
             raise
 
         (self.host, self.port) = self._socket.getsockname()[0:2]
-        LOG.info(_("%(name)s listening on %(host)s:%(port)s"),
+        LOG.info(_LI("%(name)s listening on %(host)s:%(port)s"),
                  {'name': self.name, 'host': self.host, 'port': self.port})
 
     def start(self):
@@ -159,6 +160,18 @@ class Server(object):
         # to keep file descriptor usable.
 
         dup_socket = self._socket.dup()
+        dup_socket.setsockopt(socket.SOL_SOCKET,
+                              socket.SO_REUSEADDR, 1)
+        # sockets can hang around forever without keepalive
+        dup_socket.setsockopt(socket.SOL_SOCKET,
+                              socket.SO_KEEPALIVE, 1)
+
+        # This option isn't available in the OS X version of eventlet
+        if hasattr(socket, 'TCP_KEEPIDLE'):
+            dup_socket.setsockopt(socket.IPPROTO_TCP,
+                                  socket.TCP_KEEPIDLE,
+                                  CONF.tcp_keepidle)
+
         if self._use_ssl:
             try:
                 ca_file = CONF.ssl_ca_file
@@ -195,23 +208,10 @@ class Server(object):
 
                 dup_socket = eventlet.wrap_ssl(dup_socket,
                                                **ssl_kwargs)
-
-                dup_socket.setsockopt(socket.SOL_SOCKET,
-                                      socket.SO_REUSEADDR, 1)
-                # sockets can hang around forever without keepalive
-                dup_socket.setsockopt(socket.SOL_SOCKET,
-                                      socket.SO_KEEPALIVE, 1)
-
-                # This option isn't available in the OS X version of eventlet
-                if hasattr(socket, 'TCP_KEEPIDLE'):
-                    dup_socket.setsockopt(socket.IPPROTO_TCP,
-                                    socket.TCP_KEEPIDLE,
-                                    CONF.tcp_keepidle)
-
             except Exception:
                 with excutils.save_and_reraise_exception():
-                    LOG.error(_("Failed to start %(name)s on %(host)s"
-                                ":%(port)s with SSL support"),
+                    LOG.error(_LE("Failed to start %(name)s on %(host)s"
+                                  ":%(port)s with SSL support"),
                               {'name': self.name, 'host': self.host,
                                'port': self.port})
 
@@ -250,7 +250,7 @@ class Server(object):
         :returns: None
 
         """
-        LOG.info(_("Stopping WSGI server."))
+        LOG.info(_LI("Stopping WSGI server."))
 
         if self._server is not None:
             # Resize pool to stop new requests from being processed
@@ -270,7 +270,7 @@ class Server(object):
                 self._pool.waitall()
                 self._server.wait()
         except greenlet.GreenletExit:
-            LOG.info(_("WSGI server has stopped."))
+            LOG.info(_LI("WSGI server has stopped."))
 
 
 class Request(webob.Request):
@@ -531,6 +531,6 @@ class Loader(object):
             LOG.debug("Loading app %(name)s from %(path)s",
                       {'name': name, 'path': self.config_path})
             return deploy.loadapp("config:%s" % self.config_path, name=name)
-        except LookupError as err:
-            LOG.error(err)
+        except LookupError:
+            LOG.exception(_LE("Couldn't lookup app: %s"), name)
             raise exception.PasteAppNotFound(name=name, path=self.config_path)

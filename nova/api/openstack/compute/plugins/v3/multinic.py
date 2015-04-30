@@ -15,7 +15,6 @@
 
 """The multinic extension."""
 
-import webob
 from webob import exc
 
 from nova.api.openstack import common
@@ -28,14 +27,15 @@ from nova import exception
 
 
 ALIAS = "os-multinic"
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class MultinicController(wsgi.Controller):
     def __init__(self, *args, **kwargs):
         super(MultinicController, self).__init__(*args, **kwargs)
-        self.compute_api = compute.API()
+        self.compute_api = compute.API(skip_policy_check=True)
 
+    @wsgi.response(202)
     @wsgi.action('addFixedIp')
     @extensions.expected_errors((400, 404))
     @validation.schema(multinic.add_fixed_ip)
@@ -44,16 +44,14 @@ class MultinicController(wsgi.Controller):
         context = req.environ['nova.context']
         authorize(context)
 
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
         network_id = body['addFixedIp']['networkId']
         try:
             self.compute_api.add_fixed_ip(context, instance, network_id)
         except exception.NoMoreFixedIps as e:
             raise exc.HTTPBadRequest(explanation=e.format_message())
 
-        return webob.Response(status_int=202)
-
+    @wsgi.response(202)
     @wsgi.action('removeFixedIp')
     @extensions.expected_errors((400, 404))
     @validation.schema(multinic.remove_fixed_ip)
@@ -62,16 +60,13 @@ class MultinicController(wsgi.Controller):
         context = req.environ['nova.context']
         authorize(context)
 
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
         address = body['removeFixedIp']['address']
 
         try:
             self.compute_api.remove_fixed_ip(context, instance, address)
         except exception.FixedIpNotFoundForSpecificInstance as e:
             raise exc.HTTPBadRequest(explanation=e.format_message())
-
-        return webob.Response(status_int=202)
 
 
 # Note: The class name is as it has to be for this to be loaded as an

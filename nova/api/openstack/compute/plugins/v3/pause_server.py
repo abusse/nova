@@ -13,7 +13,6 @@
 #   License for the specific language governing permissions and limitations
 #   under the License.
 
-import webob
 from webob import exc
 
 from nova.api.openstack import common
@@ -25,60 +24,55 @@ from nova.i18n import _
 
 ALIAS = "os-pause-server"
 
-
-def authorize(context, action_name):
-    action = 'v3:%s:%s' % (ALIAS, action_name)
-    extensions.extension_authorizer('compute', action)(context)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class PauseServerController(wsgi.Controller):
     def __init__(self, *args, **kwargs):
         super(PauseServerController, self).__init__(*args, **kwargs)
-        self.compute_api = compute.API()
+        self.compute_api = compute.API(skip_policy_check=True)
 
+    @wsgi.response(202)
     @extensions.expected_errors((404, 409, 501))
     @wsgi.action('pause')
     def _pause(self, req, id, body):
         """Permit Admins to pause the server."""
         ctxt = req.environ['nova.context']
-        authorize(ctxt, 'pause')
-        server = common.get_instance(self.compute_api, ctxt, id,
-                                     want_objects=True)
+        authorize(ctxt, action='pause')
+        server = common.get_instance(self.compute_api, ctxt, id)
         try:
             self.compute_api.pause(ctxt, server)
         except exception.InstanceIsLocked as e:
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                    'pause')
+                    'pause', id)
         except exception.InstanceNotFound as e:
             raise exc.HTTPNotFound(explanation=e.format_message())
         except NotImplementedError:
             msg = _("Virt driver does not implement pause function.")
             raise exc.HTTPNotImplemented(explanation=msg)
-        return webob.Response(status_int=202)
 
+    @wsgi.response(202)
     @extensions.expected_errors((404, 409, 501))
     @wsgi.action('unpause')
     def _unpause(self, req, id, body):
         """Permit Admins to unpause the server."""
         ctxt = req.environ['nova.context']
-        authorize(ctxt, 'unpause')
-        server = common.get_instance(self.compute_api, ctxt, id,
-                                     want_objects=True)
+        authorize(ctxt, action='unpause')
+        server = common.get_instance(self.compute_api, ctxt, id)
         try:
             self.compute_api.unpause(ctxt, server)
         except exception.InstanceIsLocked as e:
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                    'unpause')
+                    'unpause', id)
         except exception.InstanceNotFound as e:
             raise exc.HTTPNotFound(explanation=e.format_message())
         except NotImplementedError:
             msg = _("Virt driver does not implement pause function.")
             raise exc.HTTPNotImplemented(explanation=msg)
-        return webob.Response(status_int=202)
 
 
 class PauseServer(extensions.V3APIExtensionBase):

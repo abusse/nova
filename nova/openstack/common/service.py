@@ -18,7 +18,7 @@
 """Generic Node base class for all workers that run on hosts."""
 
 import errno
-import logging as std_logging
+import logging
 import os
 import random
 import signal
@@ -35,17 +35,14 @@ except ImportError:
 
 import eventlet
 from eventlet import event
-from oslo.config import cfg
+from oslo_config import cfg
 
 from nova.openstack.common import eventlet_backdoor
-from nova.openstack.common.gettextutils import _LE, _LI, _LW
-from nova.openstack.common import importutils
-from nova.openstack.common import log as logging
+from nova.openstack.common._i18n import _LE, _LI, _LW
 from nova.openstack.common import systemd
 from nova.openstack.common import threadgroup
 
 
-rpc = importutils.try_import('nova.openstack.common.rpc')
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 
@@ -165,7 +162,7 @@ class ServiceLauncher(Launcher):
         signo = 0
 
         LOG.debug('Full set of CONF:')
-        CONF.log_opt_values(LOG, std_logging.DEBUG)
+        CONF.log_opt_values(LOG, logging.DEBUG)
 
         try:
             if ready_callback:
@@ -180,16 +177,11 @@ class ServiceLauncher(Launcher):
             status = exc.code
         finally:
             self.stop()
-            if rpc:
-                try:
-                    rpc.cleanup()
-                except Exception:
-                    # We're shutting down, so it doesn't matter at this point.
-                    LOG.exception(_LE('Exception during rpc cleanup.'))
 
         return status, signo
 
     def wait(self, ready_callback=None):
+        systemd.notify_once()
         while True:
             self.handle_signal()
             status, signo = self._wait_for_exit_or_signal(ready_callback)
@@ -207,22 +199,26 @@ class ServiceWrapper(object):
 
 
 class ProcessLauncher(object):
-    def __init__(self, wait_interval=0.01):
-        """Constructor.
+    _signal_handlers_set = set()
 
-        :param wait_interval: The interval to sleep for between checks
-                              of child process exit.
-        """
+    @classmethod
+    def _handle_class_signals(cls, *args, **kwargs):
+        for handler in cls._signal_handlers_set:
+            handler(*args, **kwargs)
+
+    def __init__(self):
+        """Constructor."""
+
         self.children = {}
         self.sigcaught = None
         self.running = True
-        self.wait_interval = wait_interval
         rfd, self.writepipe = os.pipe()
         self.readpipe = eventlet.greenio.GreenPipe(rfd, 'r')
         self.handle_signal()
 
     def handle_signal(self):
-        _set_signals_handler(self._handle_signal)
+        self._signal_handlers_set.add(self._handle_signal)
+        _set_signals_handler(self._handle_class_signals)
 
     def _handle_signal(self, signo, frame):
         self.sigcaught = signo
@@ -267,7 +263,7 @@ class ProcessLauncher(object):
             launcher.wait()
         except SignalExit as exc:
             signame = _signo_to_signame(exc.signo)
-            LOG.info(_LI('Caught %s, exiting'), signame)
+            LOG.info(_LI('Child caught %s, exiting'), signame)
             status = exc.code
             signo = exc.signo
         except SystemExit as exc:
@@ -341,8 +337,8 @@ class ProcessLauncher(object):
 
     def _wait_child(self):
         try:
-            # Don't block if no child processes have exited
-            pid, status = os.waitpid(0, os.WNOHANG)
+            # Block while any of child processes have exited
+            pid, status = os.waitpid(0, 0)
             if not pid:
                 return None
         except OSError as exc:
@@ -371,10 +367,6 @@ class ProcessLauncher(object):
         while self.running:
             wrap = self._wait_child()
             if not wrap:
-                # Yield to other threads if no children have exited
-                # Sleep for a short time to avoid excessive CPU usage
-                # (see bug #1095346)
-                eventlet.greenthread.sleep(self.wait_interval)
                 continue
             while self.running and len(wrap.children) < wrap.workers:
                 self._start_child(wrap)
@@ -382,26 +374,41 @@ class ProcessLauncher(object):
     def wait(self):
         """Loop waiting on children to die and respawning as necessary."""
 
+        systemd.notify_once()
         LOG.debug('Full set of CONF:')
-        CONF.log_opt_values(LOG, std_logging.DEBUG)
+        CONF.log_opt_values(LOG, logging.DEBUG)
 
         try:
             while True:
                 self.handle_signal()
                 self._respawn_children()
-                if self.sigcaught:
-                    signame = _signo_to_signame(self.sigcaught)
-                    LOG.info(_LI('Caught %s, stopping children'), signame)
+                # No signal means that stop was called.  Don't clean up here.
+                if not self.sigcaught:
+                    return
+
+                signame = _signo_to_signame(self.sigcaught)
+                LOG.info(_LI('Caught %s, stopping children'), signame)
                 if not _is_sighup_and_daemon(self.sigcaught):
                     break
 
+                cfg.CONF.reload_config_files()
+                for service in set(
+                        [wrap.service for wrap in self.children.values()]):
+                    service.reset()
+
                 for pid in self.children:
                     os.kill(pid, signal.SIGHUP)
+
                 self.running = True
                 self.sigcaught = None
         except eventlet.greenlet.GreenletExit:
-            LOG.info(_LI("Wait called after thread killed.  Cleaning up."))
+            LOG.info(_LI("Wait called after thread killed. Cleaning up."))
 
+        self.stop()
+
+    def stop(self):
+        """Terminate child processes and wait on each."""
+        self.running = False
         for pid in self.children:
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -432,8 +439,8 @@ class Service(object):
     def start(self):
         pass
 
-    def stop(self):
-        self.tg.stop()
+    def stop(self, graceful=False):
+        self.tg.stop(graceful)
         self.tg.wait()
         # Signal that service cleanup is done:
         if not self._done.ready():
@@ -488,7 +495,6 @@ class Services(object):
 
         """
         service.start()
-        systemd.notify_once()
         done.wait()
 
 

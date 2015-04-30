@@ -3,4 +3,14 @@
 set -o pipefail
 
 TESTRARGS=$1
-python -m nova.openstack.common.lockutils python setup.py testr --slowest --testr-args="--subunit $TESTRARGS" | $(dirname $0)/subunit-trace.py --no-failure-debug -f
+
+# --until-failure is not compatible with --subunit see:
+#
+# https://bugs.launchpad.net/testrepository/+bug/1411804
+#
+# this work around exists until that is addressed
+if [[ "$TESTARGS" =~ "until-failure" ]]; then
+    python setup.py testr --slowest --testr-args="$TESTRARGS"
+else
+    python setup.py testr --slowest --testr-args="--subunit $TESTRARGS" | subunit-trace -f
+fi

@@ -20,10 +20,15 @@ Starting point for routing EC2 requests.
 
 import hashlib
 
-from eventlet.green import httplib
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_context import context as common_context
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import importutils
+from oslo_utils import netutils
+from oslo_utils import timeutils
+import requests
 import six
-import six.moves.urllib.parse as urlparse
 import webob
 import webob.dec
 import webob.exc
@@ -36,13 +41,9 @@ from nova import context
 from nova import exception
 from nova.i18n import _
 from nova.i18n import _LE
+from nova.i18n import _LI
 from nova.i18n import _LW
-from nova.openstack.common import importutils
-from nova.openstack.common import jsonutils
-from nova.openstack.common import log as logging
 from nova.openstack.common import memorycache
-from nova.openstack.common import timeutils
-from nova import utils
 from nova import wsgi
 
 
@@ -72,11 +73,14 @@ ec2_opts = [
     cfg.IntOpt('ec2_timestamp_expiry',
                default=300,
                help='Time in seconds before ec2 timestamp expires'),
+    cfg.BoolOpt('keystone_ec2_insecure', default=False, help='Disable SSL '
+                'certificate verification.'),
     ]
 
 CONF = cfg.CONF
 CONF.register_opts(ec2_opts)
 CONF.import_opt('use_forwarded_for', 'nova.api.auth')
+CONF.import_group('ssl', 'nova.openstack.common.sslutils')
 
 
 # Fault Wrapper around all EC2 requests
@@ -87,8 +91,8 @@ class FaultWrapper(wsgi.Middleware):
     def __call__(self, req):
         try:
             return req.get_response(self.application)
-        except Exception as ex:
-            LOG.exception(_("FaultWrapper: %s"), unicode(ex))
+        except Exception:
+            LOG.exception(_LE("FaultWrapper error"))
             return faults.Fault(webob.exc.HTTPInternalServerError())
 
 
@@ -168,12 +172,13 @@ class Lockout(wsgi.Middleware):
                 # NOTE(vish): To use incr, failures has to be a string.
                 self.mc.set(failures_key, '1', time=CONF.lockout_window * 60)
             elif failures >= CONF.lockout_attempts:
-                LOG.warn(_LW('Access key %(access_key)s has had %(failures)d '
-                             'failed authentications and will be locked out '
-                             'for %(lock_mins)d minutes.'),
-                         {'access_key': access_key,
-                          'failures': failures,
-                          'lock_mins': CONF.lockout_minutes})
+                LOG.warning(_LW('Access key %(access_key)s has had '
+                                '%(failures)d failed authentications and '
+                                'will be locked out for %(lock_mins)d '
+                                'minutes.'),
+                            {'access_key': access_key,
+                             'failures': failures,
+                             'lock_mins': CONF.lockout_minutes})
                 self.mc.set(failures_key, str(failures),
                             time=CONF.lockout_minutes * 60)
         return res
@@ -220,7 +225,12 @@ class EC2KeystoneAuth(wsgi.Middleware):
 
     @webob.dec.wsgify(RequestClass=wsgi.Request)
     def __call__(self, req):
-        request_id = context.generate_request_id()
+        # NOTE(alevine) We need to calculate the hash here because
+        # subsequent access to request modifies the req.body so the hash
+        # calculation will yield invalid results.
+        body_hash = hashlib.sha256(req.body).hexdigest()
+
+        request_id = common_context.generate_request_id()
         signature = self._get_signature(req)
         if not signature:
             msg = _("Signature not provided")
@@ -232,12 +242,14 @@ class EC2KeystoneAuth(wsgi.Middleware):
             return faults.ec2_error_response(request_id, "AuthFailure", msg,
                                              status=400)
 
-        # Make a copy of args for authentication and signature verification.
-        auth_params = dict(req.params)
-        # Not part of authentication args
-        auth_params.pop('Signature', None)
+        if 'X-Amz-Signature' in req.params or 'Authorization' in req.headers:
+            auth_params = {}
+        else:
+            # Make a copy of args for authentication and signature verification
+            auth_params = dict(req.params)
+            # Not part of authentication args
+            auth_params.pop('Signature', None)
 
-        body_hash = hashlib.sha256(req.body).hexdigest()
         cred_dict = {
             'access': access,
             'signature': signature,
@@ -255,23 +267,25 @@ class EC2KeystoneAuth(wsgi.Middleware):
         creds_json = jsonutils.dumps(creds)
         headers = {'Content-Type': 'application/json'}
 
-        o = urlparse.urlparse(CONF.keystone_ec2_url)
-        if o.scheme == "http":
-            conn = httplib.HTTPConnection(o.netloc)
-        else:
-            conn = httplib.HTTPSConnection(o.netloc)
-        conn.request('POST', o.path, body=creds_json, headers=headers)
-        response = conn.getresponse()
-        data = response.read()
-        if response.status != 200:
-            if response.status == 401:
-                msg = response.reason
-            else:
-                msg = _("Failure communicating with keystone")
+        verify = not CONF.keystone_ec2_insecure
+        if verify and CONF.ssl.ca_file:
+            verify = CONF.ssl.ca_file
+
+        cert = None
+        if CONF.ssl.cert_file and CONF.ssl.key_file:
+            cert = (CONF.ssl.cert_file, CONF.ssl.key_file)
+        elif CONF.ssl.cert_file:
+            cert = CONF.ssl.cert_file
+
+        response = requests.request('POST', CONF.keystone_ec2_url,
+                                    data=creds_json, headers=headers,
+                                    verify=verify, cert=cert)
+        status_code = response.status_code
+        if status_code != 200:
+            msg = response.reason
             return faults.ec2_error_response(request_id, "AuthFailure", msg,
-                                             status=response.status)
-        result = jsonutils.loads(data)
-        conn.close()
+                                             status=status_code)
+        result = response.json()
 
         try:
             token_id = result['access']['token']['id']
@@ -283,7 +297,7 @@ class EC2KeystoneAuth(wsgi.Middleware):
                      in result['access']['user']['roles']]
         except (AttributeError, KeyError) as e:
             LOG.error(_LE("Keystone failure: %s"), e)
-            msg = _("Failure communicating with keystone")
+            msg = _("Failure parsing response from keystone: %s") % e
             return faults.ec2_error_response(request_id, "AuthFailure", msg,
                                              status=400)
 
@@ -368,7 +382,7 @@ class Requestify(wsgi.Middleware):
         except KeyError:
             raise webob.exc.HTTPBadRequest()
         except exception.InvalidRequest as err:
-            raise webob.exc.HTTPBadRequest(explanation=unicode(err))
+            raise webob.exc.HTTPBadRequest(explanation=six.text_type(err))
 
         LOG.debug('action: %s', action)
         for key, value in args.items():
@@ -448,7 +462,7 @@ class Authorizer(wsgi.Middleware):
         if self._matches_any_role(context, allowed_roles):
             return self.application
         else:
-            LOG.audit(_('Unauthorized request for controller=%(controller)s '
+            LOG.info(_LI('Unauthorized request for controller=%(controller)s '
                         'and action=%(action)s'),
                       {'controller': controller, 'action': action},
                       context=context)
@@ -484,7 +498,7 @@ class Validator(wsgi.Middleware):
         'image_id': validator.validate_ec2_id,
         'attribute': validator.validate_str(),
         'image_location': validator.validate_image_path,
-        'public_ip': utils.is_valid_ipv4,
+        'public_ip': netutils.is_valid_ipv4,
         'region_name': validator.validate_str(),
         'group_name': validator.validate_str(max_length=255),
         'group_description': validator.validate_str(max_length=255),
@@ -553,9 +567,9 @@ def ec2_error_ex(ex, req, code=None, message=None, unexpected=False):
     request_id = context.request_id
     log_msg_args = {
         'ex_name': type(ex).__name__,
-        'ex_str': unicode(ex)
+        'ex_str': ex
     }
-    log_fun(log_msg % log_msg_args, context=context)
+    log_fun(log_msg, log_msg_args, context=context)
 
     if ex.args and not message and (not unexpected or status < 500):
         message = unicode(ex.args[0])

@@ -12,29 +12,29 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""Provides Openstack config generators
+"""Provides OpenStack config generators
 
 This module defines a class for configuration
 generators for generating the model in
 :mod:`openstack.common.report.models.conf`.
 """
 
-from oslo.config import cfg
+from oslo_config import cfg
 
-import nova.openstack.common.report.models.conf as cm
+from nova.openstack.common.report.models import conf as cm
 
 
 class ConfigReportGenerator(object):
     """A Configuration Data Generator
 
     This generator returns
-    :class:`openstack.common.report.models.conf.ConfigModel` ,
+    :class:`openstack.common.report.models.conf.ConfigModel`,
     by default using the configuration options stored
-    in :attr:`oslo.config.cfg.CONF`, which is where
-    Openstack stores everything.
+    in :attr:`oslo_config.cfg.CONF`, which is where
+    OpenStack stores everything.
 
     :param cnf: the configuration option object
-    :type cnf: :class:`oslo.config.cfg.ConfigOpts`
+    :type cnf: :class:`oslo_config.cfg.ConfigOpts`
     """
 
     def __init__(self, cnf=cfg.CONF):

@@ -17,28 +17,26 @@ import webob.exc
 
 from nova.api.openstack import common
 from nova.api.openstack import extensions
+from nova.api.openstack import wsgi
 from nova import compute
 from nova import exception
 from nova.i18n import _
 
 
 ALIAS = "os-server-diagnostics"
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
-class ServerDiagnosticsController(object):
+class ServerDiagnosticsController(wsgi.Controller):
     def __init__(self):
-        self.compute_api = compute.API()
+        self.compute_api = compute.API(skip_policy_check=True)
 
     @extensions.expected_errors((404, 409, 501))
     def index(self, req, server_id):
         context = req.environ["nova.context"]
         authorize(context)
-        try:
-            instance = self.compute_api.get(context, server_id,
-                want_objects=True)
-        except exception.InstanceNotFound as e:
-            raise webob.exc.HTTPNotFound(explanation=e.format_message())
+
+        instance = common.get_instance(self.compute_api, context, server_id)
 
         try:
             # NOTE(gmann): To make V21 same as V2 API, this method will call
@@ -49,7 +47,7 @@ class ServerDiagnosticsController(object):
             return self.compute_api.get_diagnostics(context, instance)
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                    'get_diagnostics')
+                    'get_diagnostics', server_id)
         except NotImplementedError:
             msg = _("Unable to get diagnostics, functionality not implemented")
             raise webob.exc.HTTPNotImplemented(explanation=msg)

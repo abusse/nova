@@ -25,14 +25,14 @@ from nova.i18n import _
 
 
 ALIAS = "os-admin-password"
-authorize = extensions.extension_authorizer('compute', 'v3:%s' % ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class AdminPasswordController(wsgi.Controller):
 
     def __init__(self, *args, **kwargs):
         super(AdminPasswordController, self).__init__(*args, **kwargs)
-        self.compute_api = compute.API()
+        self.compute_api = compute.API(skip_policy_check=True)
 
     # TODO(eliqiao): Here should be 204(No content) instead of 202 by v2.1
     # +micorversions because the password has been changed when returning
@@ -46,15 +46,14 @@ class AdminPasswordController(wsgi.Controller):
         authorize(context)
 
         password = body['changePassword']['adminPass']
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
         try:
             self.compute_api.set_admin_password(context, instance, password)
         except exception.InstancePasswordSetFailed as e:
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as e:
             raise common.raise_http_conflict_for_instance_invalid_state(
-                e, 'changePassword')
+                e, 'changePassword', id)
         except NotImplementedError:
             msg = _("Unable to set password on instance")
             raise exc.HTTPNotImplemented(explanation=msg)
